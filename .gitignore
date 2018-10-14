@@ -1,0 +1,9 @@
+*.sh
+.DS_Store
+*.ipynb_checkpoints
+*.csv
+*.pyc
+*.pkl
+*.npz
+*.h5
+*.jpg
