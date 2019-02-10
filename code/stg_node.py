@@ -8,7 +8,7 @@ class STGNode(object):
         return (isinstance(other, self.__class__) 
                 and self.name == other.name 
                 and self.type == other.type)
-    
+
     
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -26,3 +26,7 @@ class STGNode(object):
     
 def convert_to_label_node(node):
     return STGNode(node.name + '_label', node.type)
+
+
+def convert_from_label_node(node):
+    return STGNode(node.name[:-6], node.type)
