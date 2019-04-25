@@ -1,6 +1,8 @@
-# Modeling Dynamic Spatiotemporal Graphs
+# The Trajectron: Probabilistic Multi-Agent Trajectory Modeling with Dynamic Spatiotemporal Graphs
 
-This repository contains the code for [Modeling Multimodal Dynamic Spatiotemporal Graphs](https://arxiv.org/abs/1810.05993) by Boris Ivanovic and Marco Pavone.
+This repository contains the code for [The Trajectron: Probabilistic Multi-Agent Trajectory Modeling with Dynamic Spatiotemporal Graphs](https://arxiv.org/abs/1810.05993) by Boris Ivanovic and Marco Pavone.
+
+**NOTE**: This repository will be updated in the future (approx. 1 to 1.5 months) to fully match the results in the paper, right now it is slightly outdated.
 
 ## Installation ##
 
