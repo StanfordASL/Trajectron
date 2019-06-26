@@ -8,20 +8,20 @@ from stg_node import STGNode, convert_to_label_node, convert_from_label_node
 from collections import defaultdict
 
 # This class implements a streamlined version of MultimodalGenerativeCVAE
-# which is optimized for streaming data (i.e. repeatedly predicting with 
+# which is optimized for streaming data (i.e. repeatedly predicting with
 # a batch size of 1, updating the encoder and calling the decoder
 # seperately, etc).
 class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
-    def __init__(self, 
-                 node, 
-                 model_registrar, 
-                 robot_node, 
+    def __init__(self,
+                 node,
+                 model_registrar,
+                 robot_node,
                  kwargs_dict,
                  device,
                  scene_graph=None):
-        super(OnlineMultimodalGenerativeCVAE, self).__init__(node, 
-                 model_registrar, 
-                 robot_node, 
+        super(OnlineMultimodalGenerativeCVAE, self).__init__(node,
+                 model_registrar,
+                 robot_node,
                  kwargs_dict,
                  device,
                  scene_graph,
@@ -76,7 +76,12 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
 
     def add_edge_model(self, edge_type, new_neighbor_nodes):
         for other_node in new_neighbor_nodes:
-            self.edge_properties[self.get_edge_to(other_node)] = {'mask_arr': self.edge_addition_filter, 'age': 0}
+            edge = self.get_edge_to(other_node)
+            self.edge_properties[edge] = {'mask_arr': self.edge_addition_filter, 'age': 0}
+
+            if edge in self.removed_edges:
+                self.removed_neighbors_by_edge_type[edge.type].remove(other_node)
+                self.removed_edges.remove(edge)
 
         if edge_type + '/edge_encoder' not in self.node_modules:
             self.add_submodule(edge_type + '/edge_encoder',
@@ -119,52 +124,59 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
 
 
     def obtain_encoded_tensor_dict(self, new_inputs_dict, robot_future):
-        TD = dict()    # tensor_dict        
+        TD = dict()    # tensor_dict
         connected_edge_types = self.neighbors_via_edge_type.keys()
 
         our_present = str(self.node) + "_present"
-        robot_present = str(self.robot_node) + "_present"
-        
+        if self.robot_node is not None:
+            robot_present = str(self.robot_node) + "_present"
+
         self.node_connects_to_robot = False
-        for edge_type in connected_edge_types:
-            if self.robot_node.type in edge_type and self.robot_node in self.neighbors_via_edge_type[edge_type]:
-                self.node_connects_to_robot = True
-                break
+        if self.robot_node is not None:
+            for edge_type in connected_edge_types:
+                if ((self.robot_node.type in edge_type) and
+                    (self.robot_node in self.neighbors_via_edge_type[edge_type])):
+                    self.node_connects_to_robot = True
+                    break
 
         TD[our_present] = new_inputs_dict[self.node] # [bs, state_dim]
         if self.node_connects_to_robot:
             TD[robot_present + "_orig"] = new_inputs_dict[self.robot_node] # [bs, state_dim]
-        else:
+        elif self.robot_node is not None:
             TD[robot_present + "_orig"] = torch.zeros(1, self.hyperparams['state_dim'])
-        
+
         our_prediction_present = TD[our_present][:,self.hyperparams['pred_indices']]        # [bs/nbs, pred_dim]
-        TD["joint_present_orig"] = torch.cat([TD[robot_present + "_orig"], our_prediction_present], dim=1) # [bs/nbs, state_dim+pred_dim]
+        if self.robot_node is not None:
+            TD["joint_present_orig"] = torch.cat([TD[robot_present + "_orig"], our_prediction_present], dim=1) # [bs/nbs, state_dim+pred_dim]
+        else:
+            TD["joint_present_orig"] = our_prediction_present
 
         # Node History
         TD["history_encoder_orig"] = self.encode_node_history(TD[our_present])
         # print('TD["history_encoder_orig"]', TD["history_encoder_orig"])
         batch_size = TD["history_encoder_orig"].size()[0]
-        
+
         # Node Edges
         # print('obtain_encoded_tensor_dict', self.node)
         # print('obtain_encoded_tensor_dict', connected_edge_types)
         for edge_type in self.removed_neighbors_by_edge_type:
             for node in self.removed_neighbors_by_edge_type[edge_type]:
-                # This is adding zeros to the inputs of encoders for removed 
+                # This is adding zeros to the inputs of encoders for removed
                 # edges (until their influence is completely removed).
                 new_inputs_dict[node] = torch.zeros(1, self.hyperparams['state_dim'])
 
         TD["edge_encoders_orig"] = [self.encode_edge(edge_type, self.neighbors_via_edge_type[edge_type], new_inputs_dict) for edge_type in connected_edge_types] # List of [bs/nbs, enc_rnn_dim]
-        TD["total_edge_influence_orig"] = self.encode_total_edge_influence(TD["edge_encoders_orig"], batch_size) # [bs/nbs, 4*enc_rnn_dim]
+        TD["total_edge_influence_orig"] = self.encode_total_edge_influence(TD["edge_encoders_orig"], TD["history_encoder_orig"], batch_size) # [bs/nbs, 4*enc_rnn_dim]
 
         TD["x"] = self.create_encoder_rep(TD, robot_future)
         return TD
 
 
     def create_encoder_rep(self, TD, robot_future=None):
-        robot_present = str(self.robot_node) + "_present"
+        if self.robot_node is not None:
+            robot_present = str(self.robot_node) + "_present"
 
-        if robot_future is not None:
+        if self.robot_node is not None and robot_future is not None:
             robot_future_str = str(self.robot_node) + "_future"
             # Updating the robot_future in the TD.
             TD[robot_future_str] = torch.unsqueeze(robot_future, dim=0)
@@ -180,31 +192,34 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
 
         else:
             TD["joint_present"] = TD["joint_present_orig"]
-            TD[robot_present] = TD[robot_present + "_orig"]
             TD["history_encoder"] = TD["history_encoder_orig"]
             TD["total_edge_influence"] = TD["total_edge_influence_orig"]
-        
+            if self.robot_node is not None:
+                TD[robot_present] = TD[robot_present + "_orig"]
+
         # Changing it here because we're repeating all our tensors by the number of samples.
         batch_size = TD["history_encoder"].size()[0]
 
         # Holds what will be concatenated to make TD["x"]
         concat_list = list()
-        
+
         # Every node has an edge-influence encoder (which could just be zero).
         concat_list.append(TD["total_edge_influence"])  # [bs/nbs, 4*enc_rnn_dim]
 
         # Every node has a history encoder.
         concat_list.append(TD["history_encoder"])       # [bs/nbs, enc_rnn_dim_history]
 
-        if self.node_connects_to_robot and robot_future is not None:
-            TD[self.robot_node.type + "_robot_future_encoder"] = self.encode_robot_future(TD[robot_present], 
+        if ((self.robot_node is not None) and
+            (self.node_connects_to_robot) and
+            (robot_future is not None)):
+            TD[self.robot_node.type + "_robot_future_encoder"] = self.encode_robot_future(TD[robot_present],
                                                                                           TD[robot_future_str],
-                                                                                          ModeKeys.PREDICT, 
-                                                                                          self.robot_node.type + '_robot') 
+                                                                                          ModeKeys.PREDICT,
+                                                                                          self.robot_node.type + '_robot')
                                                                                           # [bs/nbs, 4*enc_rnn_dim_future]
-            concat_list.append(TD[self.robot_node.type + "_robot_future_encoder"])   
-            
-        else:
+            concat_list.append(TD[self.robot_node.type + "_robot_future_encoder"])
+
+        elif self.robot_node is not None:
             # Four times because we're trying to mimic a bi-directional RNN's output (which is c and h from both ends).
             concat_list.append(torch.zeros([batch_size, 4*self.hyperparams['enc_rnn_dim_future']], device=self.device))
 
@@ -227,7 +242,7 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
         return outputs[:, 0, :]
 
 
-    def encode_edge(self, edge_type, connected_nodes, new_inputs_dict):        
+    def encode_edge(self, edge_type, connected_nodes, new_inputs_dict):
         input_feature_list = [new_inputs_dict[node] for node in (list(connected_nodes) + self.removed_neighbors_by_edge_type[edge_type])]
         stacked_edge_states = torch.unsqueeze(torch.stack(input_feature_list, dim=0), dim=1)
 
@@ -242,21 +257,21 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
             if self.dynamic_edges == 'yes':
                 # Should now be a scalar.
                 edge_mask = torch.clamp(torch.sum(edge_mask, dim=0, keepdim=True), max=1.)
-            
+
         elif self.edge_state_combine_method == 'max':
             # Used in NLP, e.g. max over word embeddings in a sentence.
             combined_neighbors = torch.max(stacked_edge_states, dim=0)
             if self.dynamic_edges == 'yes':
                 # Should now be a scalar.
                 edge_mask = torch.clamp(torch.max(edge_mask, dim=0, keepdim=True), max=1.)
-            
+
         elif self.edge_state_combine_method == 'mean':
             # Used in NLP, e.g. mean over word embeddings in a sentence.
             combined_neighbors = torch.mean(stacked_edge_states, dim=0)
             if self.dynamic_edges == 'yes':
                 # Should now be a scalar.
                 edge_mask = torch.clamp(torch.mean(edge_mask, dim=0, keepdim=True), max=1.)
-        
+
         joint_history = torch.cat([combined_neighbors, torch.unsqueeze(new_inputs_dict[self.node], dim=0)], dim=2)
         # joint_history = F.dropout(joint_history,
         #                           p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
@@ -269,28 +284,28 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
         outputs = F.dropout(outputs,
                             p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
                             training=False) # [bs, max_time, enc_rnn_dim]
-        
+
         if self.dynamic_edges == 'yes':
             return outputs[:, 0, :] * edge_mask
         else:
             return outputs[:, 0, :]   # [bs, enc_rnn_dim]
 
 
-    def encode_total_edge_influence(self, encoded_edges, batch_size):
+    def encode_total_edge_influence(self, encoded_edges, node_history_encoder, batch_size):
         if self.edge_influence_combine_method == 'sum':
             stacked_encoded_edges = torch.stack(encoded_edges, dim=0)
             combined_edges = torch.sum(stacked_encoded_edges, dim=0)
-            
+
         elif self.edge_influence_combine_method == 'max':
             stacked_encoded_edges = torch.stack(encoded_edges, dim=0)
             combined_edges = torch.max(stacked_encoded_edges, dim=0)
-            
+
         elif self.edge_influence_combine_method == 'bi-rnn':
             if len(encoded_edges) == 0:
-                # Four times because we're trying to mimic a bi-directional 
+                # Four times because we're trying to mimic a bi-directional
                 # RNN's output (which is c and h from both ends).
-                combined_edges = torch.zeros((batch_size, 4*self.hyperparams['enc_rnn_dim_edge_influence']), device=self.device)
-            
+                combined_edges = torch.zeros((batch_size, self.eie_output_dims), device=self.device)
+
             else:
                 # axis=1 because then we get size [batch_size, max_time, depth]
                 encoded_edges = torch.stack(encoded_edges, dim=1)
@@ -307,24 +322,37 @@ class OnlineMultimodalGenerativeCVAE(MultimodalGenerativeCVAE):
                 combined_edges = F.dropout(combined_edges,
                                   p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
                                   training=False)
-        
+
+        elif self.edge_influence_combine_method == 'attention':
+            if len(encoded_edges) == 0:
+                combined_edges = torch.zeros((batch_size, self.eie_output_dims), device=self.device)
+
+            else:
+                # axis=1 because then we get size [batch_size, max_time, depth]
+                encoded_edges = torch.stack(encoded_edges, dim=1)
+                combined_edges, _ = self.node_modules[self.node.type + '/edge_influence_encoder'](encoded_edges, node_history_encoder)
+                combined_edges = F.dropout(combined_edges,
+                                  p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                                  training=False)
+
         return combined_edges
 
 
     # robot_future is optional here since you can use the same one from encoder_forward,
     # but if it's given then we'll re-run that part of the model (if the node is adjacent to the robot).
-    def decoder_forward(self, num_predicted_timesteps, num_samples, robot_future=None):
+    def decoder_forward(self, num_predicted_timesteps, num_samples, robot_future=None, most_likely=False):
         # Always predicting with the online model.
         mode = ModeKeys.PREDICT
 
-        if robot_future is not None:
+        if self.robot_node is not None and robot_future is not None:
             self.TD["x"] = self.create_encoder_rep(self.TD, robot_future)
             self.latent.p_dist = self.p_z_x(self.TD["x"], mode)
 
-        z = self.latent.sample_p(num_samples, mode)
+        z = self.latent.sample_p(num_samples, mode, most_likely=most_likely)
         y_dist, our_sampled_future = self.p_y_xz(self.TD["x"], z, self.TD, mode,
                                                  num_predicted_timesteps,
-                                                 num_samples)      # y_dist.mean is [k, bs, ph*state_dim]
+                                                 num_samples,
+                                                 most_likely=most_likely) # y_dist.mean is [k, bs, ph*state_dim]
 
         predictions_dict = {str(self.node) + "/y": our_sampled_future,
                             str(self.node) + "/z": z}

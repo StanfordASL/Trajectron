@@ -41,8 +41,12 @@ class CustomLR(torch.optim.lr_scheduler.LambdaLR):
 
 
 def run_lstm_on_variable_length_seqs(lstm_module, original_seqs, break_indices):
+    # This is done so that we can just pass in self.prediction_timesteps
+    # (which we want to INCLUDE, so this will exclude the next timestep).
+    inclusive_break_indices = break_indices + 1
+
     pad_list = list()
-    sorted_break_idxs, unsort_idxs = torch.sort(break_indices, descending=True)
+    sorted_break_idxs, unsort_idxs = torch.sort(inclusive_break_indices, descending=True)
     for i, seq_len in enumerate(sorted_break_idxs):
         pad_list.append(original_seqs[i, :seq_len])
 
@@ -50,7 +54,7 @@ def run_lstm_on_variable_length_seqs(lstm_module, original_seqs, break_indices):
     packed_output, (h_n, c_n) = lstm_module(packed_seqs)
     output, _ = rnn.pad_packed_sequence(packed_output, 
                                         batch_first=True,
-                                        total_length=torch.max(break_indices))
+                                        total_length=torch.max(inclusive_break_indices))
     
     # Returning it in its original order.
     return output[unsort_idxs], (h_n[:, unsort_idxs], c_n[:, unsort_idxs])

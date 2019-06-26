@@ -1,4 +1,6 @@
 import torch
+import numpy as np
+import copy
 from model.dyn_stg import SpatioTemporalGraphCVAEModel
 from model.online_node_model import OnlineMultimodalGenerativeCVAE
 from model.model_utils import ModeKeys
@@ -6,18 +8,18 @@ from utils.scene_utils import SceneGraph
 from stg_node import STGNode
 
 # How to handle removal of edges:
-# Cosine weight the previous output to 0.0 weight over a few timesteps, 
+# Cosine weight the previous output to 0.0 weight over a few timesteps,
 # then remove that LSTM from computations.
 
 # How to handle addition of edges:
-# Create a new LSTM with zero init hidden state and cosine weight 
+# Create a new LSTM with zero init hidden state and cosine weight
 # the added points up to 1.0 weight over a few timesteps.
 # This gating is on the output of the LSTM.
 class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
     def __init__(self, robot_node, model_registrar,
                  hyperparams, kwargs_dict, device):
-        super(OnlineSpatioTemporalGraphCVAEModel, self).__init__(robot_node, 
-            model_registrar, hyperparams, kwargs_dict, 
+        super(OnlineSpatioTemporalGraphCVAEModel, self).__init__(robot_node,
+            model_registrar, hyperparams, kwargs_dict,
             log_writer=None, device=device)
 
         self.edge_addition_filter = kwargs_dict['edge_addition_filter']
@@ -40,7 +42,7 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
                        'edge_removal_filter': self.edge_removal_filter,
                        'hyperparams': self.hyperparams}
 
-        self.node_models_dict[str(node)] = OnlineMultimodalGenerativeCVAE(node, 
+        self.node_models_dict[str(node)] = OnlineMultimodalGenerativeCVAE(node,
                                                                     self.model_registrar,
                                                                     self.robot_node,
                                                                     kwargs_dict,
@@ -49,6 +51,10 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
 
 
     def _remove_node_model(self, node):
+        if node == self.robot_node:
+            # We don't want to model the robot node (we are the robot).
+            return
+
         if node not in self.nodes:
             raise ValueError('%s is not in this graph!' % str(node))
 
@@ -56,8 +62,9 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
         del self.node_models_dict[str(node)]
 
 
-    def set_scene_graph(self, scene_graph): 
-        self.scene_graph = scene_graph   
+    def set_scene_graph(self, scene_graph):
+        self.scene_graph = scene_graph
+        self.nodes.clear()
         self.node_models_dict.clear()
 
         for node in scene_graph.active_nodes:
@@ -71,9 +78,11 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
             features_standardized['traj_lengths'] = inputs['traj_lengths']
 
         for node in inputs:
-            if isinstance(node, STGNode) or (mode == ModeKeys.PREDICT and node == str(self.robot_node) + '_future'):
+            if isinstance(node, STGNode) or ((mode == ModeKeys.PREDICT) and
+                                             (self.robot_node is not None) and
+                                             (node == str(self.robot_node) + '_future')):
                 if node == str(self.robot_node) + '_future':
-                    # This is handling the case of normalizing the future robot actions, 
+                    # This is handling the case of normalizing the future robot actions,
                     # which really should just take the same normalization as the robot
                     # from training.
                     node_mean = self.hyperparams['nodes_standardization'][self.robot_node]['mean']
@@ -91,27 +100,30 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
         return output * labels_std + labels_mean
 
 
-    def incremental_forward(self, robot_future, new_pos_dict, new_inputs_dict, 
-                            num_predicted_timesteps, num_samples):
+    def incremental_forward(self, robot_future, new_pos_dict, new_inputs_dict,
+                            num_predicted_timesteps, num_samples, most_likely=False):
         # This is the magic function which should make this model
         # able to handle streams. Thank you PyTorch!!
-        # The way this function works is by appending the new datapoints to the 
-        # ends of each of the LSTMs in the graph. Then, we recalculate the 
+        # The way this function works is by appending the new datapoints to the
+        # ends of each of the LSTMs in the graph. Then, we recalculate the
         # encoder's output vector h_x and feed that into the decoder to sample new outputs.
         mode = ModeKeys.PREDICT
-        
+
         # No grad since we're predicting always, as evidenced by the line above.
         with torch.no_grad():
             new_scene_graph = SceneGraph()
             new_scene_graph.create_from_scene_dict(new_pos_dict, self.scene_graph.edge_radius)
 
             new_inputs_dict = self.standardize(mode, new_inputs_dict)
-            robot_future_std = self.standardize(mode, {str(self.robot_node) + '_future': robot_future})[str(self.robot_node) + '_future']
+            if self.robot_node is not None:
+                robot_future_std = self.standardize(mode, {str(self.robot_node) + '_future': robot_future})[str(self.robot_node) + '_future']
+            else:
+                robot_future_std = None
 
             if self.dynamic_edges == 'yes':
                 new_nodes, removed_nodes, new_neighbors, removed_neighbors = new_scene_graph - self.scene_graph
-                
-                # Aside from updating the scene graph, this for loop updates the graph model 
+
+                # Aside from updating the scene graph, this for loop updates the graph model
                 # structure of all affected nodes.
                 not_removed_nodes = [node for node in self.nodes if node not in removed_nodes]
                 self.scene_graph = new_scene_graph
@@ -129,19 +141,20 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
             for node in self.node_models_dict:
                 self.node_models_dict[str(node)].encoder_forward(new_inputs_dict, robot_future_std)
 
-            # If num_predicted_timesteps or num_samples == 0 then do not run the decoder at all, 
+            # If num_predicted_timesteps or num_samples == 0 then do not run the decoder at all,
             # just update the encoder LSTMs.
             if num_predicted_timesteps == 0 or num_samples == 0:
                 return
 
-            assert robot_future.shape[0] == num_predicted_timesteps
+            if self.robot_node is not None:
+                assert robot_future.shape[0] == num_predicted_timesteps
 
-        return self.sample_model(num_predicted_timesteps, num_samples)
-    
+        return self.sample_model(num_predicted_timesteps, num_samples, most_likely=most_likely)
 
-    def sample_model(self, num_predicted_timesteps, num_samples, robot_future=None):
-        # Just start from the encoder output (minus the 
-        # robot future) and get num_samples of 
+
+    def sample_model(self, num_predicted_timesteps, num_samples, robot_future=None, most_likely=False):
+        # Just start from the encoder output (minus the
+        # robot future) and get num_samples of
         # num_predicted_timesteps-length trajectories.
         if num_predicted_timesteps == 0 or num_samples == 0:
             return
@@ -150,14 +163,14 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
 
         # No grad since we're predicting always, as evidenced by the line above.
         with torch.no_grad():
-            if robot_future is not None: 
+            if robot_future is not None:
                 assert robot_future.shape[0] == num_predicted_timesteps
                 robot_future = self.standardize(mode, {str(self.robot_node) + '_future': robot_future})
 
             predictions_dict = dict()
             for node in self.nodes:
                 model = self.node_models_dict[str(node)]
-                output_dict = model.decoder_forward(num_predicted_timesteps, num_samples, robot_future)
+                output_dict = model.decoder_forward(num_predicted_timesteps, num_samples, robot_future, most_likely=most_likely)
 
                 node_mean = self.hyperparams['nodes_standardization'][node]['mean'][self.hyperparams['pred_indices']]
                 node_std = self.hyperparams['nodes_standardization'][node]['std'][self.hyperparams['pred_indices']]
@@ -167,17 +180,23 @@ class OnlineSpatioTemporalGraphCVAEModel(SpatioTemporalGraphCVAEModel):
         return predictions_dict
 
 
-    def forward(self, pos_history, input_history, robot_future,
-                num_predicted_timesteps, num_samples):
-        # This is the standard forward prediction function, 
-        # if you have some historical data and just want to 
+    def forward(self, init_scene_graph, pos_history, input_history, robot_future,
+                num_predicted_timesteps, num_samples, most_likely=False):
+        # This is the standard forward prediction function,
+        # if you have some historical data and just want to
         # predict forward some number of timesteps.
-        for i in range(input_history.values()[0].shape[0]):
+
+        # Setting us back to the initial scene graph we had.
+        self.set_scene_graph(init_scene_graph)
+
+        # Looping through and applying updates to the model.
+        timesteps = next(iter(input_history.values())).shape[0]
+        for i in range(timesteps):
             self.incremental_forward(robot_future,
-                                     {k: v[i] for k, v in pos_history.items()},
-                                     {k: v[i] for k, v in input_history.items()},
+                                     {k: v[i] for k, v in pos_history.items() if np.any(v[i])},
+                                     {k: v[[i]] for k, v in input_history.items() if np.any(v[i])},
                                      num_predicted_timesteps=0,
                                      num_samples=0)
 
         return self.sample_model(num_predicted_timesteps,
-                                 num_samples)
+                                 num_samples, most_likely=most_likely)

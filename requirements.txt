@@ -3,8 +3,11 @@ numpy==1.14.5
 tensorboardX==1.4
 torch==0.4.1
 torchvision==0.2.1
-scipy
+scipy==1.1.0
+scikit-learn==0.20.3
 psutil
 jupyter
 ipykernel
 imageio==2.2.0
+attrdict==2.0.0
+
