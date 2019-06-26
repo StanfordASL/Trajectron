@@ -101,14 +101,10 @@ Ignoring those indices, the batch size will be reduced from %d to %d.""" % (mhl 
                                            prediction_timesteps))
 
         mean_loss = torch.mean(torch.stack(losses))
-        if self.log_writer is not None:
-            self.log_writer.add_scalar('dynstg/train_loss', mean_loss, self.curr_iter)
-        
         return mean_loss
 
 
-    def eval_loss(self, orig_inputs, orig_labels, num_predicted_timesteps, 
-                  eval_dt=None, max_speed=None):
+    def eval_loss(self, orig_inputs, orig_labels, num_predicted_timesteps):
         mode = ModeKeys.EVAL
         inputs, labels = self.standardize(mode, orig_inputs, orig_labels)
 
@@ -140,32 +136,17 @@ Ignoring those indices, the batch size will be reduced from %d to %d.""" % (mhl 
             nll_exact_values.append(nll_exact)
 
         nll_q_is, nll_p, nll_exact = torch.mean(torch.stack(nll_q_is_values)), torch.mean(torch.stack(nll_p_values)), torch.mean(torch.stack(nll_exact_values))
-
-        if None not in [self.log_writer, eval_dt, max_speed]:
-            self.log_writer.add_scalars('dynstg/eval', 
-            							{'nll_q_is': nll_q_is,
-										 'nll_p': nll_p,
-										 'nll_exact': nll_exact},
-										self.curr_iter)
-
-            pred_fig = plot_utils.plot_predictions_during_training(self, orig_inputs,
-                                                                   num_predicted_timesteps,
-                                                                   num_samples=100,
-                                                                   dt=eval_dt, 
-                                                                   max_speed=max_speed)
-            self.log_writer.add_figure('dynstg/eval_prediction', pred_fig, self.curr_iter)
-
         return nll_q_is, nll_p, nll_exact
 
 
-    def predict(self, inputs, num_predicted_timesteps, num_samples):
+    def predict(self, inputs, num_predicted_timesteps, num_samples, most_likely=False):
         mode = ModeKeys.PREDICT
         inputs = self.standardize(mode, inputs)
 
         predictions_dict = dict()
         for node in self.nodes:
             model = self.node_models_dict[str(node)]
-            output_dict = model.predict(inputs, num_predicted_timesteps, num_samples)
+            output_dict = model.predict(inputs, num_predicted_timesteps, num_samples, most_likely=most_likely)
 
             node_mean = self.hyperparams['nodes_standardization'][node]['mean'][self.hyperparams['pred_indices']]
             node_std = self.hyperparams['nodes_standardization'][node]['std'][self.hyperparams['pred_indices']]

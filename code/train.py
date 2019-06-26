@@ -10,16 +10,17 @@ import random
 import argparse
 import stg_node
 import pathlib
+from collections import defaultdict
 from model.dyn_stg import SpatioTemporalGraphCVAEModel
 from model.model_registrar import ModelRegistrar
 from utils.scene_utils import create_batch_scene_graph
-from utils import plot_utils
+from utils import plot_utils, eval_utils
 from tensorboardX import SummaryWriter
 
 hyperparams = {
     ### Training
     ## Batch Sizes
-    'batch_size': 16,
+    'batch_size': 64,
     ## Learning Rate
     'learning_rate': 0.001,
     'min_learning_rate': 0.00001,
@@ -30,8 +31,8 @@ hyperparams = {
     'grad_clip': 1.0,
 
     ### Prediction
-    'minimum_history_length': 5,    # 0.5 seconds
-    'prediction_horizon': 15,       # 1.5 seconds (at least as far as the loss function is concerned)
+    'minimum_history_length': 8,    # 3.2 seconds
+    'prediction_horizon': 12,       # 4.8 seconds (at least as far as the loss function is concerned)
 
     ### Variational Objective
     ## Objective Formulation
@@ -99,31 +100,35 @@ parser.add_argument("--edge_radius", help="the radius (in meters) within which t
 parser.add_argument("--edge_state_combine_method", help="the method to use for combining edges of the same type",
                     type=str, default='sum')
 parser.add_argument("--edge_influence_combine_method", help="the method to use for combining edge influences",
-                    type=str, default='bi-rnn')
+                    type=str, default='attention')
 parser.add_argument('--edge_addition_filter', nargs='+', help="what scaling to use for edges as they're created",
                     type=float, default=[0.25, 0.5, 1.0]) # We automatically pad left with 0.0
 parser.add_argument('--edge_removal_filter', nargs='+', help="what scaling to use for edges as they're removed",
                     type=float, default=[1.0, 0.5, 0.25]) # We automatically pad right with 0.0
+parser.add_argument('--incl_robot_node', help="whether to include a robot node in the graph or simply model all agents",
+                    action='store_true')
 
-parser.add_argument("--preloaded_data", help="which dataset to use if using one of the paper's original datasets. One of {nba, eth}. NOTE: This will overwrite the data_dir, train_data_dict, eval_data_dict, and log_dir arguments",
-                    type=str, default='eth')
+parser.add_argument("--preloaded_data", help="which dataset to use if using one of the paper's original datasets. One of {nba, eth, debug, sgan-{eth, hotel, univ, zara1, zara2}}. NOTE: This will overwrite the data_dir, train_data_dict, eval_data_dict, and log_dir arguments",
+                    type=str, default=None)
 
 parser.add_argument("--data_dir", help="what dir to look in for data",
-                    type=str, default='../ewap-dataset/data')
+                    type=str, default='debug')
 parser.add_argument("--train_data_dict", help="what file to load for training data",
-                    type=str, default='train_data_dict.pkl')
+                    type=str, default='debug_train_data.pkl')
 parser.add_argument("--eval_data_dict", help="what file to load for evaluation data",
-                    type=str, default='eval_data_dict.pkl')
+                    type=str, default='debug_eval_data.pkl')
 parser.add_argument("--log_dir", help="what dir to save training information (i.e., saved models, logs, etc)",
-                    type=str, default='../ewap-dataset/logs')
-parser.add_argument("--eval_device", help="what device to use during evaluation",
-                    type=str, default=None)
+                    type=str, default='debug/logs')
 
 parser.add_argument('--device', help='what device to perform training on',
                     type=str, default='cuda:1')
+parser.add_argument("--eval_device", help="what device to use during evaluation",
+                    type=str, default=None)
 
 parser.add_argument("--num_iters", help="number of iterations to train for",
-                    type=int, default=2001)
+                    type=int, default=2000)
+parser.add_argument('--batch_multiplier', help='how many minibatches to run per iteration of training',
+                    type=int, default=1)
 parser.add_argument('--batch_size', help='training batch size',
                     type=int, default=hyperparams['batch_size'])
 parser.add_argument('--eval_batch_size', help='evaluation batch size',
@@ -131,19 +136,19 @@ parser.add_argument('--eval_batch_size', help='evaluation batch size',
 parser.add_argument('--k_eval', help='how many samples to take during evaluation',
                     type=int, default=hyperparams['k_eval'])
 
-parser.add_argument('--seed', help='manual seed to use, default is random',
-                    type=int, default=123) # TODO: Make this None.
+parser.add_argument('--seed', help='manual seed to use, default is 123',
+                    type=int, default=123)
 parser.add_argument('--eval_every', help='how often to evaluate during training, never if None',
-                    type=int, default=10)
+                    type=int, default=100)
 parser.add_argument('--save_every', help='how often to save during training, never if None',
-                    type=int, default=10)
+                    type=int, default=100)
 args = parser.parse_args()
 if not torch.cuda.is_available() or args.device == 'cpu':
     args.device = torch.device('cpu')
 else:
     if torch.cuda.device_count() == 1:
         # If you have CUDA_VISIBLE_DEVICES set, which you should,
-        # then this will prevent leftover flag arguments from 
+        # then this will prevent leftover flag arguments from
         # messing with the device allocation.
         args.device = 'cuda:0'
 
@@ -156,7 +161,24 @@ hyperparams['batch_size'] = args.batch_size
 hyperparams['k_eval'] = args.k_eval
 
 if args.preloaded_data is not None:
-    if args.preloaded_data == 'eth':
+    if args.preloaded_data.startswith('sgan-'):
+        data_source = args.preloaded_data.split('-')[1]
+
+        args.data_dir = '../sgan-dataset/data'
+        args.train_data_dict = '%s_train.pkl' % data_source
+        args.eval_data_dict = '%s_val.pkl' % data_source
+        args.log_dir = '../sgan-dataset/logs/%s' % data_source
+
+        # This is the edge radius to use for the pedestrian datasets.
+        # The default one is for the NBA dataset.
+        args.edge_radius = 1.5
+        args.edge_addition_filter = [0.25, 0.5, 0.75, 1.0]
+        args.edge_removal_filter = [1.0, 0.0]
+
+        # 44.72 km/h = 12.42 m/s i.e. that's the max value that a velocity coordinate can be.
+        max_speed = 12.422222
+
+    elif args.preloaded_data == 'ewap':
         args.data_dir = '../ewap-dataset/data'
         args.train_data_dict = 'train_data_dict.pkl'
         args.eval_data_dict = 'eval_data_dict.pkl'
@@ -166,9 +188,18 @@ if args.preloaded_data is not None:
         args.edge_radius = 1.5
         args.edge_addition_filter = [0.25, 0.5, 0.75, 1.0]
         args.edge_removal_filter = [1.0, 0.0]
-        
+
         # 44.72 km/h = 12.42 m/s i.e. that's the max value that a velocity coordinate can be.
         max_speed = 12.422222
+
+    elif args.preloaded_data == 'debug':
+        args.data_dir = 'debug'
+        args.train_data_dict = 'debug_train_data.pkl'
+        args.eval_data_dict = 'debug_eval_data.pkl'
+        args.log_dir = 'debug/logs'
+
+        # This is an arbitrary velocity limit choice.
+        max_speed = 100.
 
     elif args.preloaded_data == 'nba':
         args.data_dir = '../nba-dataset/data'
@@ -177,6 +208,7 @@ if args.preloaded_data is not None:
         args.log_dir = '../nba-dataset/logs'
         args.eval_device = torch.device('cpu')
 
+        args.edge_radius = 2.0 * 3.28084
         args.edge_addition_filter = [0.04, 0.06, 0.09, 0.12, 0.17, 0.25, 0.35, 0.5, 0.7, 1.0]
         args.edge_removal_filter = [1.0, 0.7, 0.5, 0.35, 0.25, 0.17, 0.12, 0.09, 0.06, 0.04]
 
@@ -186,13 +218,25 @@ if args.preloaded_data is not None:
 else:
     max_speed = 100.
 
-print('Using device:', args.device, 
-      'and eval_device:', args.eval_device, 
-      'and max_speed', max_speed, 
-      'and edge_radius', args.edge_radius, 
-      'and dynamic_edges', args.dynamic_edges, 
-      'and edge_addition_filter', args.edge_addition_filter, 
-      'and edge_removal_filter', args.edge_removal_filter)
+print('-----------------------')
+print('| TRAINING PARAMETERS |')
+print('-----------------------')
+print('| batch_size: %d' % args.batch_size)
+print('| batch_multiplier: %d' % args.batch_multiplier)
+print('| effective batch size: %d (= %d * %d)' % (args.batch_size * args.batch_multiplier, args.batch_size, args.batch_multiplier))
+print('| device: %s' % args.device)
+print('| eval_device: %s' % args.eval_device)
+print('| max_speed: %s' % max_speed)
+print('| edge_radius: %s' % args.edge_radius)
+print('| EE state_combine_method: %s' % args.edge_state_combine_method)
+print('| EIE scheme: %s' % args.edge_influence_combine_method)
+print('| dynamic_edges: %s' % args.dynamic_edges)
+print('| robot node: %s' % args.incl_robot_node)
+print('| edge_addition_filter: %s' % args.edge_addition_filter)
+print('| edge_removal_filter: %s' % args.edge_removal_filter)
+print('| MHL: %s' % hyperparams['minimum_history_length'])
+print('| PH: %s' % hyperparams['prediction_horizon'])
+print('-----------------------')
 
 if args.seed is not None:
     random.seed(args.seed)
@@ -204,7 +248,7 @@ if args.seed is not None:
 
 def main():
     # Create the log and model directiory if they're not present.
-    model_dir = os.path.join(args.log_dir, 
+    model_dir = os.path.join(args.log_dir,
                              'models_' + time.strftime('%d_%b_%Y_%H_%M_%S', time.localtime()))
     pathlib.Path(model_dir).mkdir(parents=True, exist_ok=True)
 
@@ -223,13 +267,23 @@ def main():
         eval_dt = eval_data_dict['dt']
         print('Loaded evaluation data from %s, eval_dt = %.2f' % (eval_data_path, eval_dt))
 
-    if args.preloaded_data == 'eth':
-        robot_node = stg_node.STGNode('0', 'Pedestrian')
-    elif args.preloaded_data == 'nba':
-        robot_node = stg_node.STGNode('Al Horford', 'HomeC')
+    if args.incl_robot_node:
+        if args.preloaded_data is None or args.preloaded_data == 'debug':
+            robot_node = stg_node.STGNode('0', 'Particle')
+        elif args.preloaded_data == 'ewap' or args.preloaded_data.startswith('sgan-'):
+            robot_node = stg_node.STGNode('0', 'Pedestrian')
+        elif args.preloaded_data == 'nba':
+            robot_node = stg_node.STGNode('Al Horford', 'HomeC')
+    else:
+        robot_node = None
+
+    for key in train_data_dict['input_dict'].keys():
+        if isinstance(key, stg_node.STGNode):
+            random_node = key
+            break
 
     model_registrar = ModelRegistrar(model_dir, args.device)
-    hyperparams['state_dim'] = train_data_dict['input_dict'][robot_node].shape[2]
+    hyperparams['state_dim'] = train_data_dict['input_dict'][random_node].shape[2]
     hyperparams['pred_dim'] = len(train_data_dict['pred_indices'])
     hyperparams['pred_indices'] = train_data_dict['pred_indices']
     hyperparams['dynamic_edges'] = args.dynamic_edges
@@ -250,7 +304,7 @@ def main():
 
     stg = SpatioTemporalGraphCVAEModel(robot_node, model_registrar,
                                        hyperparams, kwargs_dict,
-                                       log_writer, args.device)
+                                       None, args.device)
     print('Created training STG model.')
 
     if args.eval_every is not None:
@@ -259,7 +313,7 @@ def main():
         # randomly-initialized weights!
         eval_stg = SpatioTemporalGraphCVAEModel(robot_node, model_registrar,
                                                 eval_hyperparams, kwargs_dict,
-                                                log_writer, args.eval_device)
+                                                None, args.eval_device)
         print('Created evaluation STG model.')
 
     # Create the aggregate scene_graph for all the data, allowing
@@ -267,16 +321,16 @@ def main():
     # we'll show how much faster this method is than keeping the
     # full version. Can show graphs of forward inference time vs problem size
     # with two lines (using aggregate graph, using online-computed graph).
-    agg_scene_graph = create_batch_scene_graph(train_data_dict['input_dict'], 
+    agg_scene_graph = create_batch_scene_graph(train_data_dict['input_dict'],
                                                float(hyperparams['edge_radius']),
                                                use_old_method=(args.dynamic_edges=='no'))
     print('Created aggregate training scene graph.')
-    
+
     if args.dynamic_edges == 'yes':
         agg_scene_graph.compute_edge_scaling(args.edge_addition_filter, args.edge_removal_filter)
         train_data_dict['input_dict']['edge_scaling_mask'] = agg_scene_graph.edge_scaling_mask
         print('Computed edge scaling for the training scene graph.')
-    
+
     stg.set_scene_graph(agg_scene_graph)
     stg.set_annealing_params()
 
@@ -285,7 +339,7 @@ def main():
                                                         float(hyperparams['edge_radius']),
                                                         use_old_method=(args.dynamic_edges=='no'))
         print('Created aggregate evaluation scene graph.')
-        
+
         if args.dynamic_edges == 'yes':
             eval_agg_scene_graph.compute_edge_scaling(args.edge_addition_filter, args.edge_removal_filter)
             eval_data_dict['input_dict']['edge_scaling_mask'] = eval_agg_scene_graph.edge_scaling_mask
@@ -297,6 +351,9 @@ def main():
     # model_registrar.print_model_names()
     optimizer = optim.Adam(model_registrar.parameters(), lr=hyperparams['learning_rate'])
     lr_scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=hyperparams['learning_decay_rate'])
+
+    # Keeping colors consistent throughout training.
+    color_dict = defaultdict(dict)
 
     print_training_header(newline_start=True)
     for curr_iter in range(args.num_iters):
@@ -316,23 +373,30 @@ def main():
         # Zeroing gradients for the upcoming iteration.
         optimizer.zero_grad()
 
-        # Obtaining the batch's training loss.
-        train_inputs, train_labels = sample_inputs_and_labels(train_data_dict, batch_size=hyperparams['batch_size'])
+        train_losses = list()
+        for mb_num in range(args.batch_multiplier):
+            # Obtaining the batch's training loss.
+            train_inputs, train_labels = sample_inputs_and_labels(train_data_dict, batch_size=hyperparams['batch_size'])
 
-        # Compute the training loss.
-        train_loss = stg.train_loss(train_inputs, train_labels, hyperparams['prediction_horizon'])
+            # Compute the training loss.
+            train_loss = stg.train_loss(train_inputs, train_labels, hyperparams['prediction_horizon']) / args.batch_multiplier
+            train_losses.append(train_loss.item())
+
+            # Calculating gradients.
+            train_loss.backward()
 
         # Print training information. Also, no newline here. It's added in at a later line.
-        print('{:9} | {:10} | '.format(curr_iter, '%.2f' % train_loss.item()),
+        iter_train_loss = sum(train_losses)
+        print('{:9} | {:10} | '.format(curr_iter, '%.2f' % iter_train_loss),
               end='', flush=True)
 
-        # Calculating gradients.
-        train_loss.backward()
+        log_writer.add_histogram('dynstg/train_minibatch_losses', np.asarray(train_losses), curr_iter)
+        log_writer.add_scalar('dynstg/train_loss', iter_train_loss, curr_iter)
 
         # Clipping gradients.
         if hyperparams['grad_clip'] is not None:
             nn.utils.clip_grad_value_(model_registrar.parameters(), hyperparams['grad_clip'])
-        
+
         # # Logging gradient norms.
         # len_prefix = len('model_dict.')
         # for name, param in model_registrar.named_parameters():
@@ -356,20 +420,82 @@ def main():
                 pred_fig = plot_utils.plot_predictions_during_training(stg, train_inputs,
                                                                        hyperparams['prediction_horizon'],
                                                                        num_samples=100,
-                                                                       dt=train_dt, 
-                                                                       max_speed=max_speed)
+                                                                       dt=train_dt,
+                                                                       max_speed=max_speed,
+                                                                       color_dict=color_dict,
+                                                                       most_likely=True)
                 log_writer.add_figure('dynstg/train_prediction', pred_fig, curr_iter)
+
+                train_mse_batch_errors, train_fse_batch_errors = eval_utils.compute_batch_statistics(stg,
+                                                                   train_data_dict,
+                                                                   hyperparams['minimum_history_length'],
+                                                                   hyperparams['prediction_horizon'],
+                                                                   num_samples=100,
+                                                                   num_runs=100,
+                                                                   dt=train_dt,
+                                                                   max_speed=max_speed,
+                                                                   robot_node=robot_node)
+                log_writer.add_histogram('dynstg/train_mse', train_mse_batch_errors, curr_iter)
+                log_writer.add_histogram('dynstg/train_fse', train_fse_batch_errors, curr_iter)
+
+                mse_boxplot_fig, fse_boxplot_fig = plot_utils.plot_boxplots_during_training(train_mse_batch_errors, train_fse_batch_errors)
+                log_writer.add_figure('dynstg/train_mse_boxplot', mse_boxplot_fig, curr_iter)
+                log_writer.add_figure('dynstg/train_fse_boxplot', fse_boxplot_fig, curr_iter)
+
+                log_writer.add_scalars('dynstg/train_sq_error',
+                                       {'mean_mse': torch.mean(train_mse_batch_errors),
+                                        'mean_fse': torch.mean(train_fse_batch_errors),
+                                        'median_mse': torch.median(train_mse_batch_errors),
+                                        'median_fse': torch.median(train_fse_batch_errors)},
+                                       curr_iter)
 
                 # Then computing evaluation values and predictions.
                 model_registrar.to(args.eval_device)
                 eval_stg.set_curr_iter(curr_iter)
-                eval_inputs, eval_labels = sample_inputs_and_labels(eval_data_dict, 
-                                                                    device=args.eval_device, 
+                eval_inputs, eval_labels = sample_inputs_and_labels(eval_data_dict,
+                                                                    device=args.eval_device,
                                                                     batch_size=args.eval_batch_size)
-                
-                (eval_loss_q_is, eval_loss_p, eval_loss_exact) = eval_stg.eval_loss(eval_inputs, eval_labels, 
-                                                                                    hyperparams['prediction_horizon'], 
-                                                                                    eval_dt=eval_dt, max_speed=max_speed)
+
+                (eval_loss_q_is, eval_loss_p, eval_loss_exact) = eval_stg.eval_loss(eval_inputs, eval_labels,
+                                                                                    hyperparams['prediction_horizon'])
+                log_writer.add_scalars('dynstg/eval',
+                                       {'nll_q_is': eval_loss_q_is,
+                                        'nll_p': eval_loss_p,
+                                        'nll_exact': eval_loss_exact},
+                                       curr_iter)
+
+                pred_fig = plot_utils.plot_predictions_during_training(eval_stg, eval_inputs,
+                                                                       hyperparams['prediction_horizon'],
+                                                                       num_samples=100,
+                                                                       dt=eval_dt,
+                                                                       max_speed=max_speed,
+                                                                       color_dict=color_dict,
+                                                                       most_likely=True)
+                log_writer.add_figure('dynstg/eval_prediction', pred_fig, curr_iter)
+
+                eval_mse_batch_errors, eval_fse_batch_errors = eval_utils.compute_batch_statistics(eval_stg,
+                                                                   eval_data_dict,
+                                                                   hyperparams['minimum_history_length'],
+                                                                   hyperparams['prediction_horizon'],
+                                                                   num_samples=100,
+                                                                   num_runs=100,
+                                                                   dt=eval_dt,
+                                                                   max_speed=max_speed,
+                                                                   robot_node=robot_node)
+                log_writer.add_histogram('dynstg/eval_mse', eval_mse_batch_errors, curr_iter)
+                log_writer.add_histogram('dynstg/eval_fse', eval_fse_batch_errors, curr_iter)
+
+                mse_boxplot_fig, fse_boxplot_fig = plot_utils.plot_boxplots_during_training(eval_mse_batch_errors, eval_fse_batch_errors)
+                log_writer.add_figure('dynstg/eval_mse_boxplot', mse_boxplot_fig, curr_iter)
+                log_writer.add_figure('dynstg/eval_fse_boxplot', fse_boxplot_fig, curr_iter)
+
+                log_writer.add_scalars('dynstg/eval_sq_error',
+                                       {'mean_mse': torch.mean(eval_mse_batch_errors),
+                                        'mean_fse': torch.mean(eval_fse_batch_errors),
+                                        'median_mse': torch.median(eval_mse_batch_errors),
+                                        'median_fse': torch.median(eval_fse_batch_errors)},
+                                       curr_iter)
+
                 print('{:15} | {:10} | {:14}'.format('%.2f' % eval_loss_q_is.item(), '%.2f' % eval_loss_p.item(), '%.2f' % eval_loss_exact.item()),
                       end='', flush=True)
 
@@ -377,11 +503,11 @@ def main():
                 del eval_loss_q_is
                 del eval_loss_p
                 del eval_loss_exact
-        
+
         else:
             print('{:15} | {:10} | {:14}'.format('', '', ''),
                   end='', flush=True)
-        
+
         # Here's the newline that ends the current training information printing.
         print('')
 
@@ -393,14 +519,14 @@ def main():
 def print_training_header(newline_start=False):
     if newline_start:
         print('')
-    
+
     print('Iteration | Train Loss | Eval NLL Q (IS) | Eval NLL P | Eval NLL Exact')
     print('----------------------------------------------------------------------')
 
 
 def sample_inputs_and_labels(data_dict, device=args.device, batch_size=None):
     if batch_size is not None:
-        batch_sample = np.random.randint(low=0, 
+        batch_sample = np.random.randint(low=0,
                                          high=data_dict['input_dict']['traj_lengths'].shape[0],
                                          size=batch_size)
         inputs = {k: torch.from_numpy(v[batch_sample]).float() for k, v in data_dict['input_dict'].items() if v.size > 0}
@@ -424,3 +550,27 @@ def memInUse():
 
 if __name__ == '__main__':
     main()
+
+# IDEA: Experiments could be toy (like the deepmind ones,
+#       but with objects blinking in and out of the environment) and also basketball.
+# TODO: A test could be rather than radius based,
+#       you do exponential-weighted and then cutoff
+#       below some thresh?
+# TODO: Ego-centric data for basketball dataset.
+# TODO: Create test environments, see if DM open-sourced
+#       their datasets (pray).
+# TODO: Test how unspecific you can make the node labels,
+#       first drop home and away, then drop positions but keep home and away,
+#       then drop all and just call them "players"
+# TODO: Use cosine as the gating function since it's differentiable
+#       and continuous with y=0 and y=1 at points.
+# TODO: An argument for why not to just pre-create all possible graphs (like what Karen suggested)
+#       is that if you have a complete graph created as a result of all possible graphs, but the
+#       actual data never realizes that complete graph, then you're completely wasting that O(N^2)
+#       memory (even if you have some smart graph computation routing so that you avoid all other nodes).
+# TODO: In lit review, discuss UofT graph networks (Ethan Fetaya) and DeepMind graph networks (Alvaro ...,
+#       describe the approach and detail how it only learns one function and also is for static graphs).
+#       Also talk about Bayesian non-parametrics? Also talk about dynamic bayesian networks.
+#       Talk to Joe Lorenzetti about these.
+# TODO: Karren from ICML seemed to think that summing same edge-type nodes was a common practice in graph stuff,
+#       see if can find any citations other than StructuralRNN.

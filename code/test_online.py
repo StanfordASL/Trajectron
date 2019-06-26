@@ -10,10 +10,11 @@ import random
 import argparse
 import stg_node
 import pathlib
+from collections import defaultdict
 from model.online_dyn_stg import OnlineSpatioTemporalGraphCVAEModel
 from model.model_registrar import ModelRegistrar
 from utils.scene_utils import Scene
-from utils import plot_utils
+from utils import plot_utils, eval_utils
 
 
 hyperparams = {
@@ -30,8 +31,8 @@ hyperparams = {
     'grad_clip': 1.0,
 
     ### Prediction
-    'minimum_history_length': 5,    # 0.5 seconds
-    'prediction_horizon': 15,       # 1.5 seconds (at least as far as the loss function is concerned)
+    'minimum_history_length': 8,    # 3.2 seconds
+    'prediction_horizon': 12,       # 4.8 seconds (at least as far as the loss function is concerned)
 
     ### Variational Objective
     ## Objective Formulation
@@ -97,35 +98,49 @@ parser.add_argument("--dynamic_edges", help="whether to use dynamic edges or not
 parser.add_argument("--edge_radius", help="the radius (in meters) within which two nodes will be connected by an edge",
                     type=float, default=1.5)
 parser.add_argument("--edge_state_combine_method", help="the method to use for combining edges of the same type",
-                    type=str, default='sum')
+                    type=str, default=None)
 parser.add_argument("--edge_influence_combine_method", help="the method to use for combining edge influences",
-                    type=str, default='bi-rnn')
+                    type=str, default=None)
 parser.add_argument('--edge_addition_filter', nargs='+', help="what scaling to use for edges as they're created",
                     type=float, default=[0.25, 0.5, 0.75, 1.0]) # We automatically pad left with 0.0
 parser.add_argument('--edge_removal_filter', nargs='+', help="what scaling to use for edges as they're removed",
                     type=float, default=[1.0, 0.0]) # We automatically pad right with 0.0
+parser.add_argument('--incl_robot_node', help="whether to include a robot node in the graph or simply model all agents",
+                    action='store_true')
+
+parser.add_argument('--full_preds', help="whether to use our Full model or our Most Likely model (z_best, default)",
+                    action='store_true')
 
 parser.add_argument("--data_dir", help="what dir to look in for data",
-                    type=str, default='../ewap-dataset/data')
+                    type=str, default='../sgan-dataset/data')
 parser.add_argument("--test_data_dict", help="what file to load for testing data",
-                    type=str, default='eval_data_dict.pkl')
+                    type=str, default=None)
 parser.add_argument("--trained_model_dir", help="what trained model to use",
-                    type=str, default='../ewap-dataset/logs/models_28_Jan_2019_15_35_20')
+                    type=str, default=None)
+parser.add_argument("--trained_model_iter", help="what trained model iteration to use",
+                    type=int, default=None)
+
+# parser.add_argument("--data_dir", help="what dir to look in for data",
+#                     type=str, default='debug')
+# parser.add_argument("--test_data_dict", help="what file to load for testing data",
+#                     type=str, default='debug_eval_data.pkl')
+# parser.add_argument("--trained_model_dir", help="what trained model to use",
+#                     type=str, default='debug/logs/models_17_Feb_2019_00_15_04')
 
 parser.add_argument('--device', help='what device to perform testing on',
-                    type=str, default='cuda:1')
+                    type=str, default='cpu')
 
 parser.add_argument('--minimum_history_length', help='how many timesteps of data are required before predictions are released',
                     type=int, default=hyperparams['minimum_history_length'])
 parser.add_argument('--prediction_horizon', help='how many timesteps to predict ahead',
                     type=int, default=hyperparams['prediction_horizon'])
 parser.add_argument('--num_samples', help='how many samples to take during prediction',
-                    type=int, default=hyperparams['k_eval'])
+                    type=int, default=25)
 parser.add_argument('--plot_online', help='whether to plot predictions online or not',
                     type=str, default='yes')
 
 parser.add_argument('--seed', help='manual seed to use, default is random',
-                    type=int, default=123) # TODO: Make this None.
+                    type=int, default=None)
 args = parser.parse_args()
 if not torch.cuda.is_available() or args.device == 'cpu':
     args.device = torch.device('cpu')
@@ -147,8 +162,11 @@ if args.seed is not None:
 
 
 def main():
-    output_save_dir = 'pred_figs/%s_dyn_edges' % args.dynamic_edges
+    output_save_dir = 'pred_figs/%s_%s_dyn_edges' % ('full' if args.full_preds else 'z_best', args.dynamic_edges)
     pathlib.Path(output_save_dir).mkdir(parents=True, exist_ok=True)
+
+    if args.test_data_dict is None:
+        args.test_data_dict = random.choice(['eth', 'hotel', 'univ', 'zara1', 'zara2']) + '_test.pkl'
 
     with open(os.path.join(args.data_dir, args.test_data_dict), 'rb') as f:
         test_data_dict = pickle.load(f, encoding='latin1')
@@ -164,20 +182,43 @@ def main():
         for key in test_data_dict['labels_standardization'][node]:
             test_data_dict['labels_standardization'][node][key] = torch.from_numpy(test_data_dict['labels_standardization'][node][key]).float().to(args.device)
 
-    # robot_node = stg_node.STGNode('Al Horford', 'HomeC')
     # max_speed = 40.76
-
-    robot_node = stg_node.STGNode('0', 'Pedestrian')
+    # max_speed = 100.
     max_speed = 12.422222
+    if args.incl_robot_node:
+        # robot_node = stg_node.STGNode('Al Horford', 'HomeC')
+        # robot_node = stg_node.STGNode('0', 'Particle')
+        robot_node = stg_node.STGNode('0', 'Pedestrian')
+    else:
+        robot_node = None
 
     # Initial memory usage
-    print('%.2f MBs of RAM initially used.' % (memInUse()*1000.))
+    init_mem_usage = memInUse()*1000.
+    print('%.2f MBs of RAM initially used.' % init_mem_usage)
 
     # Loading weights from the trained model.
-    model_registrar = ModelRegistrar(args.trained_model_dir, args.device)
-    model_registrar.load_models(1999)
+    dataset_name = args.test_data_dict.split("_")[0]
+    if args.trained_model_dir is None:
+        args.trained_model_dir = os.path.join('../sgan-dataset/logs', dataset_name, eval_utils.get_our_model_dir(dataset_name))
 
-    hyperparams['state_dim'] = test_data_dict['input_dict'][robot_node].shape[2]
+    if args.trained_model_iter is None:
+        args.trained_model_iter = eval_utils.get_model_hyperparams(args, dataset_name)['best_iter']
+
+    if args.edge_state_combine_method is None: 
+        args.edge_state_combine_method = eval_utils.get_model_hyperparams(args, dataset_name)['edge_state_combine_method']
+
+    if args.edge_influence_combine_method is None: 
+        args.edge_influence_combine_method = eval_utils.get_model_hyperparams(args, dataset_name)['edge_influence_combine_method']
+
+    model_registrar = ModelRegistrar(args.trained_model_dir, args.device)
+    model_registrar.load_models(args.trained_model_iter)
+    
+    for key in test_data_dict['input_dict'].keys():
+        if isinstance(key, stg_node.STGNode):
+            random_node = key
+            break
+
+    hyperparams['state_dim'] = test_data_dict['input_dict'][random_node].shape[2]
     hyperparams['pred_dim'] = len(test_data_dict['pred_indices'])
     hyperparams['pred_indices'] = test_data_dict['pred_indices']
     hyperparams['dynamic_edges'] = args.dynamic_edges
@@ -197,7 +238,10 @@ def main():
                                                     hyperparams, kwargs_dict, 
                                                     args.device)
 
-    data_id = 11
+    data_id = random.randint(0, test_data_dict['input_dict'][random_node].shape[0] - 1)
+
+    print('Looking at the %s sequence, data_id %d' % (dataset_name, data_id))
+
     init_scene_dict = dict()
     for node, traj_data in test_data_dict['input_dict'].items():
         if isinstance(node, stg_node.STGNode):
@@ -211,12 +255,19 @@ def main():
                  'frequency': [np.nan],
                  'nodes': [len(online_stg.scene_graph.active_nodes)], 
                  'edges': [online_stg.scene_graph.num_edges], 
-                 'mem_MB': [memInUse()*1000.]}
+                 'mem_MB': [memInUse()*1000. - init_mem_usage],
+                 'mse': [np.nan],
+                 'fse': [np.nan]}
     print("At t=0, have %d nodes, %d edges which uses %.2f MBs of RAM." % (
             perf_dict['nodes'][0], perf_dict['edges'][0], perf_dict['mem_MB'][0])
          )
 
-    for curr_timestep in range(1, test_data_dict['input_dict']['traj_lengths'][data_id] - args.prediction_horizon + 1):
+    # Keeps colors constant throughout the visualization.
+    color_dict = defaultdict(dict)
+    error_info_dict = {'output_limit': max_speed}
+    start_idx = 1
+    end_idx = test_data_dict['input_dict']['traj_lengths'][data_id] - args.prediction_horizon + 1
+    for curr_timestep in range(start_idx, end_idx):
         robot_future = get_robot_future(robot_node, curr_timestep, 
                                         data_id, test_data_dict, 
                                         args.prediction_horizon)
@@ -226,16 +277,28 @@ def main():
 
         start = time.time()
         preds_dict = online_stg.incremental_forward(robot_future, new_pos_dict, new_inputs_dict, 
-                                                    args.prediction_horizon, int(args.num_samples/2))
+                                                    args.prediction_horizon, int(args.num_samples),
+                                                    most_likely=(not args.full_preds))
         end = time.time()
 
+        mse_errs, fse_errs = eval_utils.compute_preds_dict_only_agg_errors(preds_dict, test_data_dict, data_id, 
+                                                                           curr_timestep, args.prediction_horizon,
+                                                                           error_info_dict)
+        
+        if mse_errs is None and fse_errs is None:
+            print('No agents in the scene, stopping!')
+            break
+
         if args.plot_online == 'yes':
-            plot_utils.plot_online_prediction(preds_dict, new_inputs_dict, online_stg, 
+            plot_utils.plot_online_prediction(preds_dict, test_data_dict, data_id, 
+                                              args.prediction_horizon,
+                                              new_inputs_dict, online_stg, 
                                               curr_timestep, robot_future, 
                                               dt=eval_dt, max_speed=max_speed,
-                                              ylim=(2, 9), xlim=(-6, 17),
-                                              dpi=150, figsize=(2.2*4, 4),
-                                              edge_line_width=0.1, line_width=0.3,
+                                              color_dict=color_dict,
+                                              ylim=(0, 20), xlim=(0, 20),
+                                              dpi=150, figsize=(4, 4),
+                                              edge_line_width=0.1, line_width=0.5,
                                               omit_names=True,
                                               save_at=os.path.join(output_save_dir, 'online_pred_%d.png' % curr_timestep))
 
@@ -244,17 +307,26 @@ def main():
         perf_dict['frequency'].append(1./(end-start))
         perf_dict['nodes'].append(len(online_stg.scene_graph.active_nodes))
         perf_dict['edges'].append(online_stg.scene_graph.num_edges)
-        perf_dict['mem_MB'].append(memInUse()*1000.)
-        print("t=%d: took %.2f s (= %.2f Hz) and %d nodes, %d edges uses %.2f MBs of RAM." % (
+        perf_dict['mem_MB'].append(memInUse()*1000. - init_mem_usage)
+        perf_dict['mse'].append(mse_errs)
+        perf_dict['fse'].append(fse_errs)
+        print("t=%d: took %.2f s (= %.2f Hz) w/ MSE %.2f and FSE %.2f and %d nodes, %d edges uses %.2f MBs of RAM." % (
                 perf_dict['time'][-1], perf_dict['runtime'][-1], 
-                perf_dict['frequency'][-1], perf_dict['nodes'][-1],
+                perf_dict['frequency'][-1], torch.mean(perf_dict['mse'][-1]), 
+                torch.mean(perf_dict['fse'][-1]), perf_dict['nodes'][-1],
                 perf_dict['edges'][-1], perf_dict['mem_MB'][-1])
              )
 
-    plot_utils.plot_performance_metrics(perf_dict, output_save_dir)
+    if curr_timestep != start_idx:
+        plot_utils.plot_performance_metrics(perf_dict, output_save_dir, 
+                                            hyperparams['minimum_history_length'],
+                                            hyperparams['prediction_horizon'])
 
 
 def get_robot_future(robot_node, timestep, data_id, data_dict, future_length):
+    if robot_node is None:
+        return None
+
     return data_dict['input_dict'][robot_node][data_id, timestep : timestep+future_length]
 
 

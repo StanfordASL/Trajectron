@@ -43,18 +43,18 @@ class Scene(object):
     def visualize(self, ax, radius=0.3, circle_edge_width=0.5):
         for node in self.scene_dict:
             # Current Node Position
-            circle = plt.Circle(xy=(self.scene_dict[node][0], 
-                                    self.scene_dict[node][1]), 
-                                radius=radius, 
-                                facecolor='grey', 
-                                edgecolor='k', 
+            circle = plt.Circle(xy=(self.scene_dict[node][0],
+                                    self.scene_dict[node][1]),
+                                radius=radius,
+                                facecolor='grey',
+                                edgecolor='k',
                                 lw=circle_edge_width,
                                 zorder=3)
             ax.add_artist(circle)
 
-            ax.text(self.scene_dict[node][0] + radius + 0.1, 
-                    self.scene_dict[node][1], 
-                    node.name, 
+            ax.text(self.scene_dict[node][0] + radius + 0.1,
+                    self.scene_dict[node][1],
+                    node.name,
                     zorder=4)
 
 
@@ -67,18 +67,18 @@ class DirectionalEdge(object):
 
 
     def __eq__(self, other):
-        return (isinstance(other, self.__class__) 
+        return (isinstance(other, self.__class__)
                 and self.id == other.id)
 
-    
+
     def __ne__(self, other):
         return not self.__eq__(other)
 
-    
+
     def __hash__(self):
         return hash(self.id)
 
-    
+
     def __repr__(self):
         return self.id
 
@@ -182,7 +182,7 @@ class SceneGraph(object):
         self.adj_cube = adj_cube
 
         self.active_nodes = [self.nodes[idx] for idx in active_idxs]
-        
+
         self.num_edges = 0
         for idx, node in enumerate(self.active_nodes):
             self.num_edges += np.sum(self.adj_matrix[active_idxs[idx], active_idxs])
@@ -199,16 +199,20 @@ class SceneGraph(object):
 
     def get_adj_matrix(self):
         N = len(self.scene_dict)
+
+        if N == 0:
+            return None, list()
+            
         active_idxs = list()
 
         pos_matrix = np.empty((N, 2))
         for idx, node in enumerate(self.scene_dict):
             #     x position   ,     y position
             (pos_matrix[idx][0], pos_matrix[idx][1]) = self.scene_dict[node]
-            
+
             if np.asarray(self.scene_dict[node]).any():
                 active_idxs.append(idx)
-        
+
         dists = squareform(pdist(pos_matrix, metric='euclidean'))
 
         # Put a 1 for all agent pairs which are closer than the edge_radius.
@@ -217,7 +221,7 @@ class SceneGraph(object):
 
         # Remove self-loops.
         np.fill_diagonal(adj_matrix, 0)
-        
+
         return adj_matrix, active_idxs
 
 
@@ -225,21 +229,24 @@ class SceneGraph(object):
         """Construct a spatiotemporal graph from N agent positions.
 
         returns: nodes: An N-length list of ordered nodes.
-                 edge_types: An N-size dict containing lists of edge-type string 
+                 edge_types: An N-size dict containing lists of edge-type string
                              names per node.
-                 node_edges_and_neighbors: An N-size dict of edge-types per node, 
-                                           as well as which nodes are neighboring 
+                 node_edges_and_neighbors: An N-size dict of edge-types per node,
+                                           as well as which nodes are neighboring
                                            along edges of that type.
         """
         N = len(self.scene_dict)
-                
+
+        if N == 0:
+            return list(), defaultdict(list), dict()
+
         nodes = list(self.scene_dict.keys())
         pos_matrix = np.array(list(self.scene_dict.values()))
         assert pos_matrix.shape == (N, 2)
 
         adj_matrix, active_idxs = self.get_adj_matrix()
         assert adj_matrix.shape == (N, N)
-        
+
         node_edges_and_neighbors = {node: defaultdict(set) for node in nodes}
         edge_types = defaultdict(list)
         for i in active_idxs:
@@ -265,12 +272,12 @@ class SceneGraph(object):
         self.edge_scaling_mask = np.minimum(new_edges + old_edges, 1.)
 
 
-    def render(self, pos_matrix, 
+    def render(self, pos_matrix,
                filename='graph_video.mp4'):
         """
         Render a spatiotemporal graph video from N agent positions.
 
-        pos_matrix: T x N x 2 matrix describing the x and y positions 
+        pos_matrix: T x N x 2 matrix describing the x and y positions
                     of each agent over time.
         """
         import matplotlib.lines as mlines
@@ -284,7 +291,7 @@ class SceneGraph(object):
         ax.set_xlabel('Longitudinal Court Position (ft)')
         ax.set_ylabel('Lateral Court Position (ft)')
         l, = plt.plot([], [], marker='o', color='white', markeredgecolor='k', markerfacecolor='white', markeredgewidth=1.0, zorder=3)
-        
+
         # Get adj_matrix from each timestep.
         images = list()
         for t in xrange(pos_matrix.shape[0]):
@@ -296,7 +303,7 @@ class SceneGraph(object):
             for agent1 in active_idxs:
                 for agent2 in active_idxs:
                     if adj_matrix[agent1, agent2] == 1:
-                        line = mlines.Line2D([pos_matrix[t, agent1, 0], pos_matrix[t, agent2, 0]], 
+                        line = mlines.Line2D([pos_matrix[t, agent1, 0], pos_matrix[t, agent2, 0]],
                                              [pos_matrix[t, agent1, 1], pos_matrix[t, agent2, 1]],
                                              color='k')
                         ax.add_line(line)
@@ -329,7 +336,7 @@ def create_batch_scene_graph(data, edge_radius, use_old_method=True):
     """
     nodes = [x for x in data.keys() if isinstance(x, STGNode)]
     N = len(nodes)
-    total_timesteps = data['traj_lengths'].shape[0] if use_old_method else np.sum(data['traj_lengths'])        
+    total_timesteps = data['traj_lengths'].shape[0] if use_old_method else np.sum(data['traj_lengths'])
     position_cube = np.zeros((total_timesteps, N, 2))
     inactive_nodes = np.zeros((total_timesteps, N), dtype=np.int8)
     adj_cube = None
@@ -350,7 +357,7 @@ def create_batch_scene_graph(data, edge_radius, use_old_method=True):
                 position_cube[idx : idx + data['traj_lengths'][data_idx], node_idx] = data_mat
                 inactive_nodes[idx : idx + data['traj_lengths'][data_idx], node_idx] = not data_mat.any()
                 idx += data['traj_lengths'][data_idx]
-    
+
     agg_adj_matrix = np.zeros((N, N), dtype=np.int8)
     if not use_old_method:
         curr_data_idx = 0
@@ -384,7 +391,7 @@ def create_batch_scene_graph(data, edge_radius, use_old_method=True):
 
     sg = SceneGraph()
     sg.create_from_adj_matrix(agg_adj_matrix, nodes, edge_radius, adj_cube=adj_cube)
-    
+
     return sg
 
 
@@ -414,7 +421,7 @@ if __name__ == '__main__':
                   [1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0],
                   [1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1]])[:, :, np.newaxis, np.newaxis]
     print(A.shape)
-    
+
     # (data_id, time, N, N)
     edge_addition_filter = [0.1, 0.2, 1.]
     edge_removal_filter = [1.,0.1]
