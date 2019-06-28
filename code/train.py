@@ -108,7 +108,7 @@ parser.add_argument('--edge_removal_filter', nargs='+', help="what scaling to us
 parser.add_argument('--incl_robot_node', help="whether to include a robot node in the graph or simply model all agents",
                     action='store_true')
 
-parser.add_argument("--preloaded_data", help="which dataset to use if using one of the paper's original datasets. One of {nba, eth, debug, sgan-{eth, hotel, univ, zara1, zara2}}. NOTE: This will overwrite the data_dir, train_data_dict, eval_data_dict, and log_dir arguments",
+parser.add_argument("--preloaded_data", help="which dataset to use if using one of the paper's original datasets. One of 'sgan-{eth, hotel, univ, zara1, zara2}'. NOTE: This will overwrite the data_dir, train_data_dict, eval_data_dict, and log_dir arguments",
                     type=str, default=None)
 
 parser.add_argument("--data_dir", help="what dir to look in for data",
