@@ -178,43 +178,6 @@ if args.preloaded_data is not None:
         # 44.72 km/h = 12.42 m/s i.e. that's the max value that a velocity coordinate can be.
         max_speed = 12.422222
 
-    elif args.preloaded_data == 'ewap':
-        args.data_dir = '../ewap-dataset/data'
-        args.train_data_dict = 'train_data_dict.pkl'
-        args.eval_data_dict = 'eval_data_dict.pkl'
-        args.log_dir = '../ewap-dataset/logs'
-
-        # This is the edge radius to use for the ETH dataset. The default one is for the NBA dataset.
-        args.edge_radius = 1.5
-        args.edge_addition_filter = [0.25, 0.5, 0.75, 1.0]
-        args.edge_removal_filter = [1.0, 0.0]
-
-        # 44.72 km/h = 12.42 m/s i.e. that's the max value that a velocity coordinate can be.
-        max_speed = 12.422222
-
-    elif args.preloaded_data == 'debug':
-        args.data_dir = 'debug'
-        args.train_data_dict = 'debug_train_data.pkl'
-        args.eval_data_dict = 'debug_eval_data.pkl'
-        args.log_dir = 'debug/logs'
-
-        # This is an arbitrary velocity limit choice.
-        max_speed = 100.
-
-    elif args.preloaded_data == 'nba':
-        args.data_dir = '../nba-dataset/data'
-        args.train_data_dict = 'train_data_dict_2_files_100_rows.pkl'
-        args.eval_data_dict = 'eval_data_dict_2_files_100_rows.pkl'
-        args.log_dir = '../nba-dataset/logs'
-        args.eval_device = torch.device('cpu')
-
-        args.edge_radius = 2.0 * 3.28084
-        args.edge_addition_filter = [0.04, 0.06, 0.09, 0.12, 0.17, 0.25, 0.35, 0.5, 0.7, 1.0]
-        args.edge_removal_filter = [1.0, 0.7, 0.5, 0.35, 0.25, 0.17, 0.12, 0.09, 0.06, 0.04]
-
-        # 44.72 km/h = 40.76 ft/s i.e. that's the max value that a velocity coordinate can be.
-        max_speed = 40.76
-
 else:
     max_speed = 100.
 
@@ -268,12 +231,7 @@ def main():
         print('Loaded evaluation data from %s, eval_dt = %.2f' % (eval_data_path, eval_dt))
 
     if args.incl_robot_node:
-        if args.preloaded_data is None or args.preloaded_data == 'debug':
-            robot_node = stg_node.STGNode('0', 'Particle')
-        elif args.preloaded_data == 'ewap' or args.preloaded_data.startswith('sgan-'):
-            robot_node = stg_node.STGNode('0', 'Pedestrian')
-        elif args.preloaded_data == 'nba':
-            robot_node = stg_node.STGNode('Al Horford', 'HomeC')
+        robot_node = stg_node.STGNode('0', 'Pedestrian')
     else:
         robot_node = None
 
@@ -551,26 +509,3 @@ def memInUse():
 if __name__ == '__main__':
     main()
 
-# IDEA: Experiments could be toy (like the deepmind ones,
-#       but with objects blinking in and out of the environment) and also basketball.
-# TODO: A test could be rather than radius based,
-#       you do exponential-weighted and then cutoff
-#       below some thresh?
-# TODO: Ego-centric data for basketball dataset.
-# TODO: Create test environments, see if DM open-sourced
-#       their datasets (pray).
-# TODO: Test how unspecific you can make the node labels,
-#       first drop home and away, then drop positions but keep home and away,
-#       then drop all and just call them "players"
-# TODO: Use cosine as the gating function since it's differentiable
-#       and continuous with y=0 and y=1 at points.
-# TODO: An argument for why not to just pre-create all possible graphs (like what Karen suggested)
-#       is that if you have a complete graph created as a result of all possible graphs, but the
-#       actual data never realizes that complete graph, then you're completely wasting that O(N^2)
-#       memory (even if you have some smart graph computation routing so that you avoid all other nodes).
-# TODO: In lit review, discuss UofT graph networks (Ethan Fetaya) and DeepMind graph networks (Alvaro ...,
-#       describe the approach and detail how it only learns one function and also is for static graphs).
-#       Also talk about Bayesian non-parametrics? Also talk about dynamic bayesian networks.
-#       Talk to Joe Lorenzetti about these.
-# TODO: Karren from ICML seemed to think that summing same edge-type nodes was a common practice in graph stuff,
-#       see if can find any citations other than StructuralRNN.

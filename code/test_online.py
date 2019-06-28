@@ -120,13 +120,6 @@ parser.add_argument("--trained_model_dir", help="what trained model to use",
 parser.add_argument("--trained_model_iter", help="what trained model iteration to use",
                     type=int, default=None)
 
-# parser.add_argument("--data_dir", help="what dir to look in for data",
-#                     type=str, default='debug')
-# parser.add_argument("--test_data_dict", help="what file to load for testing data",
-#                     type=str, default='debug_eval_data.pkl')
-# parser.add_argument("--trained_model_dir", help="what trained model to use",
-#                     type=str, default='debug/logs/models_17_Feb_2019_00_15_04')
-
 parser.add_argument('--device', help='what device to perform testing on',
                     type=str, default='cpu')
 
@@ -182,12 +175,8 @@ def main():
         for key in test_data_dict['labels_standardization'][node]:
             test_data_dict['labels_standardization'][node][key] = torch.from_numpy(test_data_dict['labels_standardization'][node][key]).float().to(args.device)
 
-    # max_speed = 40.76
-    # max_speed = 100.
     max_speed = 12.422222
     if args.incl_robot_node:
-        # robot_node = stg_node.STGNode('Al Horford', 'HomeC')
-        # robot_node = stg_node.STGNode('0', 'Particle')
         robot_node = stg_node.STGNode('0', 'Pedestrian')
     else:
         robot_node = None
