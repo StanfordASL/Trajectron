@@ -26,6 +26,14 @@ When you're done, don't forget to deactivate the conda environment with
 source deactivate
 ```
 
+## Scripts ##
+Run any of these with a `-h` or `--help` flag to see all available command arguments.
+* `code/train.py` - Trains a new Trajectron.
+* `code/test_online.py` - Replays a scene from a dataset and performs online inference with a trained Trajectron.
+* `code/evaluate_alongside_sgan.py` - Evaluates the performance of the Trajectron against Social GAN. This script mainly collects evaluation data, which can be visualized with `sgan-dataset/Result Analyses.ipynb`.
+* `code/compare_runtimes.py` - Evaluates the runtime of the Trajectron against Social GAN. This script mainly collects runtime data, which can be visualized with `sgan-dataset/Runtime Analysis.ipynb`.
+* `sgan-dataset/Qualitative Plots.ipynb` - Can be used to visualize predictions from the Trajectron alone, or against those from Social GAN.
+
 ## Datasets ##
 
 The preprocessed datasets are available in this repository, under `data/` folders (i.e. `sgan-dataset/data/`).
