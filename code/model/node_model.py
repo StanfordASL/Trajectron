@@ -1,62 +1,61 @@
-import numpy as np
-import torch
+import warnings
 import torch.distributions as td
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.nn.utils.rnn as rnn_utils
-from model.components import GMM2D, DiscreteLatent, AdditiveAttention, TemporallyBatchedAdditiveAttention, all_one_hot_combinations
+from model.components import *
 from model.model_utils import *
 
 
 class MultimodalGenerativeCVAE(object):
-    def __init__(self, 
-                 node, 
-                 model_registrar, 
-                 robot_node, 
-                 kwargs_dict,
+    def __init__(self,
+                 node_type,
+                 model_registrar,
+                 robot_node,
+                 hyperparams,
                  device,
-                 scene_graph=None,
+                 edge_types,
                  log_writer=None):
-        self.node = node
+        self.node_type = node_type.name
         self.model_registrar = model_registrar
         self.robot_node = robot_node
         self.log_writer = log_writer
         self.device = device
+        self.edge_types = edge_types
+        self.curr_iter = 0
 
         self.node_modules = dict()
-        self.edge_state_combine_method = kwargs_dict['edge_state_combine_method']
-        self.edge_influence_combine_method = kwargs_dict['edge_influence_combine_method']
-        self.dynamic_edges = kwargs_dict['dynamic_edges']
-        self.hyperparams = kwargs_dict['hyperparams']
+        self.hyperparams = hyperparams
 
-        if scene_graph is not None:
-            self.create_graphical_model(scene_graph)
+        self.min_hl = self.hyperparams['minimum_history_length']
+        self.max_hl = self.hyperparams['maximum_history_length']
+        self.ph = self.hyperparams['prediction_horizon']
+        self.state = self.hyperparams['state']
+        self.dims = self.hyperparams['dims']
+        self.state_dim = len(self.state) * len(self.dims)
+        self.pred_state = self.hyperparams['pred_state']
+        self.pred_state_indices = np.arange(self.state.index(self.pred_state) * len(self.dims),
+                                            self.state.index(self.pred_state) * len(self.dims) + len(self.dims))
 
+        self.create_graphical_model(edge_types)
 
     def set_curr_iter(self, curr_iter):
         self.curr_iter = curr_iter
 
-
     def add_submodule(self, name, model_if_absent):
         self.node_modules[name] = self.model_registrar.get_model(name, model_if_absent)
-
 
     def clear_submodules(self):
         self.node_modules.clear()
 
-
-    def create_graphical_model(self, scene_graph):
+    def create_graphical_model(self, edge_types):
         self.clear_submodules()
-
-        self.scene_graph = scene_graph
-        self.neighbors_via_edge_type = scene_graph.node_edges_and_neighbors[self.node]
 
         ############################
         #   Node History Encoder   #
         ############################
-        self.add_submodule(self.node.type + '/node_history_encoder',
-                           model_if_absent=nn.LSTM(input_size=self.hyperparams['state_dim'],
+        self.add_submodule(self.node_type + '/node_history_encoder',
+                           model_if_absent=nn.LSTM(input_size=self.state_dim,
                                                    hidden_size=self.hyperparams['enc_rnn_dim_history'],
                                                    batch_first=True))
 
@@ -65,17 +64,17 @@ class MultimodalGenerativeCVAE(object):
         ###########################
         # We'll create this here, but then later check if in training mode.
         # Based on that, we'll factor this into the computation graph (or not).
-        self.add_submodule(self.node.type + '/node_future_encoder',
-                           model_if_absent=nn.LSTM(input_size=self.hyperparams['pred_dim'],
+        self.add_submodule(self.node_type + '/node_future_encoder',
+                           model_if_absent=nn.LSTM(input_size=len(self.dims),
                                                    hidden_size=self.hyperparams['enc_rnn_dim_future'],
                                                    bidirectional=True,
                                                    batch_first=True))
         # These are related to how you initialize states for the node future encoder.
-        self.add_submodule(self.node.type + '/node_future_encoder/initial_h',
-                           model_if_absent=nn.Linear(self.hyperparams['state_dim'],
+        self.add_submodule(self.node_type + '/node_future_encoder/initial_h',
+                           model_if_absent=nn.Linear(self.state_dim,
                                                      self.hyperparams['enc_rnn_dim_future']))
-        self.add_submodule(self.node.type + '/node_future_encoder/initial_c',
-                           model_if_absent=nn.Linear(self.hyperparams['state_dim'],
+        self.add_submodule(self.node_type + '/node_future_encoder/initial_c',
+                           model_if_absent=nn.Linear(self.state_dim,
                                                      self.hyperparams['enc_rnn_dim_future']))
 
         ############################
@@ -85,16 +84,16 @@ class MultimodalGenerativeCVAE(object):
         # Based on that, we'll factor this into the computation graph (or not).
         if self.robot_node is not None:
             self.add_submodule('robot_future_encoder',
-                               model_if_absent=nn.LSTM(input_size=self.hyperparams['state_dim'],
+                               model_if_absent=nn.LSTM(input_size=self.state_dim,
                                                        hidden_size=self.hyperparams['enc_rnn_dim_future'],
                                                        bidirectional=True,
                                                        batch_first=True))
             # These are related to how you initialize states for the robot future encoder.
             self.add_submodule('robot_future_encoder/initial_h',
-                               model_if_absent=nn.Linear(self.hyperparams['state_dim'],
+                               model_if_absent=nn.Linear(self.state_dim,
                                                          self.hyperparams['enc_rnn_dim_future']))
             self.add_submodule('robot_future_encoder/initial_c',
-                               model_if_absent=nn.Linear(self.hyperparams['state_dim'],
+                               model_if_absent=nn.Linear(self.state_dim,
                                                          self.hyperparams['enc_rnn_dim_future']))
 
         #####################
@@ -102,25 +101,26 @@ class MultimodalGenerativeCVAE(object):
         #####################
         # print('create_graphical_model', self.node)
         # print('create_graphical_model', self.neighbors_via_edge_type)
-        for edge_type in self.neighbors_via_edge_type:
-            if self.edge_state_combine_method == 'pointnet':
+        for edge_type in edge_types:
+            if self.hyperparams['edge_state_combine_method'] == 'pointnet':
                 self.add_submodule(edge_type + '/pointnet_encoder',
-                           model_if_absent=nn.Sequential(
-                                nn.Linear(self.hyperparams['state_dim'], 2*self.hyperparams['state_dim']),
-                                nn.ReLU(),
-                                nn.Linear(2*self.hyperparams['state_dim'], 2*self.hyperparams['state_dim']),
-                                nn.ReLU()))
+                                   model_if_absent=nn.Sequential(
+                                       nn.Linear(self.state_dim, 2 * self.state_dim),
+                                       nn.ReLU(),
+                                       nn.Linear(2 * self.state_dim, 2 * self.state_dim),
+                                       nn.ReLU()))
 
-                edge_encoder_input_size = 2*self.hyperparams['state_dim'] + self.hyperparams['state_dim']
-            
-            elif self.edge_state_combine_method == 'attention':
-                self.add_submodule(self.node.type + '/edge_attention_combine',
-                           model_if_absent=TemporallyBatchedAdditiveAttention(encoder_hidden_state_dim=self.hyperparams['state_dim'],
-                                                                              decoder_hidden_state_dim=self.hyperparams['state_dim']))
-                edge_encoder_input_size = self.hyperparams['state_dim'] + self.hyperparams['state_dim']
+                edge_encoder_input_size = 2 * self.state_dim + self.state_dim
+
+            elif self.hyperparams['edge_state_combine_method'] == 'attention':
+                self.add_submodule(self.node_type + '/edge_attention_combine',
+                                   model_if_absent=TemporallyBatchedAdditiveAttention(
+                                       encoder_hidden_state_dim=self.state_dim,
+                                       decoder_hidden_state_dim=self.state_dim))
+                edge_encoder_input_size = self.state_dim + self.state_dim
 
             else:
-                edge_encoder_input_size = self.hyperparams['state_dim'] + self.hyperparams['state_dim']
+                edge_encoder_input_size = self.state_dim + self.state_dim
 
             self.add_submodule(edge_type + '/edge_encoder',
                                model_if_absent=nn.LSTM(input_size=edge_encoder_input_size,
@@ -130,28 +130,29 @@ class MultimodalGenerativeCVAE(object):
         ##############################
         #   Edge Influence Encoder   #
         ##############################
-        # NOTE: The edge influence encoding happens during calls 
-        # to forward or incremental_forward, so we don't create 
+        # NOTE: The edge influence encoding happens during calls
+        # to forward or incremental_forward, so we don't create
         # a model for it here for the max and sum variants.
-        if self.edge_influence_combine_method == 'bi-rnn':
-            self.add_submodule(self.node.type + '/edge_influence_encoder',
+        if self.hyperparams['edge_influence_combine_method'] == 'bi-rnn':
+            self.add_submodule(self.node_type + '/edge_influence_encoder',
                                model_if_absent=nn.LSTM(input_size=self.hyperparams['enc_rnn_dim_edge'],
                                                        hidden_size=self.hyperparams['enc_rnn_dim_edge_influence'],
                                                        bidirectional=True,
                                                        batch_first=True))
-            
-            # Four times because we're trying to mimic a bi-directional 
+
+            # Four times because we're trying to mimic a bi-directional
             # LSTM's output (which, here, is c and h from both ends).
-            self.eie_output_dims = 4*self.hyperparams['enc_rnn_dim_edge_influence']
-        
-        elif self.edge_influence_combine_method == 'attention':
+            self.eie_output_dims = 4 * self.hyperparams['enc_rnn_dim_edge_influence']
+
+        elif self.hyperparams['edge_influence_combine_method'] == 'attention':
             # Chose additive attention because of https://arxiv.org/pdf/1703.03906.pdf
-            # We calculate an attention context vector using the encoded edges as the "encoder" (that we attend _over_) 
+            # We calculate an attention context vector using the encoded edges as the "encoder" (that we attend _over_)
             # and the node history encoder representation as the "decoder state" (that we attend _on_).
-            self.add_submodule(self.node.type + '/edge_influence_encoder',
-                               model_if_absent=AdditiveAttention(encoder_hidden_state_dim=self.hyperparams['enc_rnn_dim_edge_influence'],
-                                                                 decoder_hidden_state_dim=self.hyperparams['enc_rnn_dim_history']))
-            
+            self.add_submodule(self.node_type + '/edge_influence_encoder',
+                               model_if_absent=AdditiveAttention(
+                                   encoder_hidden_state_dim=self.hyperparams['enc_rnn_dim_edge_influence'],
+                                   decoder_hidden_state_dim=self.hyperparams['enc_rnn_dim_history']))
+
             self.eie_output_dims = self.hyperparams['enc_rnn_dim_edge_influence']
 
         ################################
@@ -162,70 +163,72 @@ class MultimodalGenerativeCVAE(object):
         ######################################################################
         #   Various Fully-Connected Layers from Encoder to Latent Variable   #
         ######################################################################
+        #       Edge Influence Encoder         Node History Encoder
+        x_size = self.eie_output_dims + self.hyperparams['enc_rnn_dim_history']
         if self.robot_node is not None:
-            #       Edge Influence Encoder         Node History Encoder                    Future Conditional Encoder
-            x_size = self.eie_output_dims + self.hyperparams['enc_rnn_dim_history'] + 4*self.hyperparams['enc_rnn_dim_future']
-        else:
-            #       Edge Influence Encoder         Node History Encoder
-            x_size = self.eie_output_dims + self.hyperparams['enc_rnn_dim_history']
+            #              Future Conditional Encoder
+            x_size += 4 * self.hyperparams['enc_rnn_dim_future']
 
         z_size = self.hyperparams['N'] * self.hyperparams['K']
 
         if self.hyperparams['p_z_x_MLP_dims'] is not None:
-            self.add_submodule(self.node.type + '/p_z_x',
+            self.add_submodule(self.node_type + '/p_z_x',
                                model_if_absent=nn.Linear(x_size, self.hyperparams['p_z_x_MLP_dims']))
             hx_size = self.hyperparams['p_z_x_MLP_dims']
         else:
             hx_size = x_size
-        
-        self.add_submodule(self.node.type + '/hx_to_z',
+
+        self.add_submodule(self.node_type + '/hx_to_z',
                            model_if_absent=nn.Linear(hx_size, self.latent.z_dim))
 
         if self.hyperparams['q_z_xy_MLP_dims'] is not None:
-            self.add_submodule(self.node.type + '/q_z_xy',
+            self.add_submodule(self.node_type + '/q_z_xy',
                                #                                           Node Future Encoder
-                               model_if_absent=nn.Linear(x_size + 4*self.hyperparams['enc_rnn_dim_future'], self.hyperparams['q_z_xy_MLP_dims']))
+                               model_if_absent=nn.Linear(x_size + 4 * self.hyperparams['enc_rnn_dim_future'],
+                                                         self.hyperparams['q_z_xy_MLP_dims']))
             hxy_size = self.hyperparams['q_z_xy_MLP_dims']
         else:
             #                           Node Future Encoder
-            hxy_size = x_size + 4*self.hyperparams['enc_rnn_dim_future']
+            hxy_size = x_size + 4 * self.hyperparams['enc_rnn_dim_future']
 
-        self.add_submodule(self.node.type + '/hxy_to_z',
+        self.add_submodule(self.node_type + '/hxy_to_z',
                            model_if_absent=nn.Linear(hxy_size, self.latent.z_dim))
 
         ####################
         #   Decoder LSTM   #
         ####################
         if self.robot_node is not None:
-            decoder_input_dims = self.hyperparams['pred_dim'] + self.hyperparams['state_dim'] + z_size + x_size
+            decoder_input_dims = len(self.dims) + self.state_dim + z_size + x_size
         else:
-            decoder_input_dims = self.hyperparams['pred_dim'] + z_size + x_size
+            decoder_input_dims = len(self.dims) + z_size + x_size
 
-        self.add_submodule(self.node.type + '/decoder/lstm_cell',
+        self.add_submodule(self.node_type + '/decoder/lstm_cell',
                            model_if_absent=nn.LSTMCell(decoder_input_dims, self.hyperparams['dec_rnn_dim']))
-        self.add_submodule(self.node.type + '/decoder/initial_h',
+        self.add_submodule(self.node_type + '/decoder/initial_h',
                            model_if_absent=nn.Linear(z_size + x_size, self.hyperparams['dec_rnn_dim']))
-        self.add_submodule(self.node.type + '/decoder/initial_c',
+        self.add_submodule(self.node_type + '/decoder/initial_c',
                            model_if_absent=nn.Linear(z_size + x_size, self.hyperparams['dec_rnn_dim']))
 
         ###################
         #   Decoder GMM   #
         ###################
-        self.add_submodule(self.node.type + '/decoder/proj_to_GMM_log_pis',
-                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'], self.hyperparams['GMM_components']))
-        self.add_submodule(self.node.type + '/decoder/proj_to_GMM_mus',
-                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'], self.hyperparams['GMM_components']*self.hyperparams['pred_dim']))
-        self.add_submodule(self.node.type + '/decoder/proj_to_GMM_log_sigmas',
-                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'], self.hyperparams['GMM_components']*self.hyperparams['pred_dim']))
-        self.add_submodule(self.node.type + '/decoder/proj_to_GMM_corrs',
-                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'], self.hyperparams['GMM_components']))
+        self.add_submodule(self.node_type + '/decoder/proj_to_GMM_log_pis',
+                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'],
+                                                     self.hyperparams['GMM_components']))
+        self.add_submodule(self.node_type + '/decoder/proj_to_GMM_mus',
+                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'],
+                                                     self.hyperparams['GMM_components'] * len(self.dims)))
+        self.add_submodule(self.node_type + '/decoder/proj_to_GMM_log_sigmas',
+                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'],
+                                                     self.hyperparams['GMM_components'] * len(self.dims)))
+        self.add_submodule(self.node_type + '/decoder/proj_to_GMM_corrs',
+                           model_if_absent=nn.Linear(self.hyperparams['dec_rnn_dim'],
+                                                     self.hyperparams['GMM_components']))
 
         for name, module in self.node_modules.items():
             module.to(self.device)
 
-
-    def create_new_scheduler(self, name, annealer, annealer_kws, 
-                             creation_condition=True):
+    def create_new_scheduler(self, name, annealer, annealer_kws, creation_condition=True):
         value_scheduler = None
         rsetattr(self, name + '_scheduler', value_scheduler)
         if creation_condition:
@@ -235,62 +238,65 @@ class MultimodalGenerativeCVAE(object):
 
             # This is the value that we'll update on each call of
             # step_annealers().
-            rsetattr(self, name, torch.tensor(value_annealer(0), device=self.device))
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                rsetattr(self, name, torch.tensor(value_annealer(0), device=self.device))
+                dummy_optimizer = optim.Optimizer([rgetattr(self, name)],
+                                                  {'lr': torch.tensor(value_annealer(0), device=self.device)})
+                rsetattr(self, name + '_optimizer', dummy_optimizer)
 
-            dummy_optimizer = optim.Optimizer([rgetattr(self, name)], {'lr': torch.tensor(value_annealer(0), device=self.device)})
-            rsetattr(self, name + '_optimizer', dummy_optimizer)
-            
-            value_scheduler = CustomLR(dummy_optimizer, 
+            value_scheduler = CustomLR(dummy_optimizer,
                                        value_annealer)
             rsetattr(self, name + '_scheduler', value_scheduler)
 
         self.schedulers.append(value_scheduler)
         self.annealed_vars.append(name)
 
-
     def set_annealing_params(self):
         self.schedulers = list()
         self.annealed_vars = list()
 
         self.create_new_scheduler(name='kl_weight',
-             annealer=sigmoid_anneal, 
-             annealer_kws={
-                'start': self.hyperparams['kl_weight_start'],
-                'finish': self.hyperparams['kl_weight'],
-                'center_step': self.hyperparams['kl_crossover'],
-                'steps_lo_to_hi': self.hyperparams['kl_crossover'] / self.hyperparams['kl_sigmoid_divisor']
-             },
-             creation_condition=((np.abs(self.hyperparams['alpha'] - 1.0) < 1e-3)
-                                 and (not self.hyperparams['use_iwae'])))
+                                  annealer=sigmoid_anneal,
+                                  annealer_kws={
+                                      'start': self.hyperparams['kl_weight_start'],
+                                      'finish': self.hyperparams['kl_weight'],
+                                      'center_step': self.hyperparams['kl_crossover'],
+                                      'steps_lo_to_hi': self.hyperparams['kl_crossover'] / self.hyperparams[
+                                          'kl_sigmoid_divisor']
+                                  },
+                                  creation_condition=((np.abs(self.hyperparams['alpha'] - 1.0) < 1e-3)
+                                                      and (not self.hyperparams['use_iwae'])))
 
         self.create_new_scheduler(name='dec_sample_model_prob',
-             annealer=sigmoid_anneal, 
-             annealer_kws={
-                'start': self.hyperparams['dec_sample_model_prob_start'],
-                'finish': self.hyperparams['dec_sample_model_prob_final'],
-                'center_step': self.hyperparams['dec_sample_model_prob_crossover'],
-                'steps_lo_to_hi': self.hyperparams['dec_sample_model_prob_crossover'] / self.hyperparams['dec_sample_model_prob_divisor']
-             },
-             creation_condition=self.hyperparams['sample_model_during_dec'])
+                                  annealer=sigmoid_anneal,
+                                  annealer_kws={
+                                      'start': self.hyperparams['dec_sample_model_prob_start'],
+                                      'finish': self.hyperparams['dec_sample_model_prob_final'],
+                                      'center_step': self.hyperparams['dec_sample_model_prob_crossover'],
+                                      'steps_lo_to_hi': self.hyperparams['dec_sample_model_prob_crossover'] /
+                                                        self.hyperparams['dec_sample_model_prob_divisor']
+                                  },
+                                  creation_condition=self.hyperparams['sample_model_during_dec'])
 
         self.create_new_scheduler(name='latent.temp',
-             annealer=exp_anneal, 
-             annealer_kws={
-                'start': self.hyperparams['tau_init'],
-                'finish': self.hyperparams['tau_final'],
-                'rate': self.hyperparams['tau_decay_rate']
-             })
+                                  annealer=exp_anneal,
+                                  annealer_kws={
+                                      'start': self.hyperparams['tau_init'],
+                                      'finish': self.hyperparams['tau_final'],
+                                      'rate': self.hyperparams['tau_decay_rate']
+                                  })
 
         self.create_new_scheduler(name='latent.z_logit_clip',
-             annealer=sigmoid_anneal, 
-             annealer_kws={
-                'start': self.hyperparams['z_logit_clip_start'],
-                'finish': self.hyperparams['z_logit_clip_final'],
-                'center_step': self.hyperparams['z_logit_clip_crossover'],
-                'steps_lo_to_hi': self.hyperparams['z_logit_clip_crossover'] / self.hyperparams['z_logit_clip_divisor']
-             },
-             creation_condition=self.hyperparams['use_z_logit_clipping'])
-
+                                  annealer=sigmoid_anneal,
+                                  annealer_kws={
+                                      'start': self.hyperparams['z_logit_clip_start'],
+                                      'finish': self.hyperparams['z_logit_clip_final'],
+                                      'center_step': self.hyperparams['z_logit_clip_crossover'],
+                                      'steps_lo_to_hi': self.hyperparams['z_logit_clip_crossover'] / self.hyperparams[
+                                          'z_logit_clip_divisor']
+                                  },
+                                  creation_condition=self.hyperparams['use_z_logit_clipping'])
 
     def step_annealers(self):
         # This should manage all of the step-wise changed
@@ -305,291 +311,305 @@ class MultimodalGenerativeCVAE(object):
 
         self.summarize_annealers()
 
-
     def summarize_annealers(self):
         if self.log_writer is not None:
             for annealed_var in self.annealed_vars:
                 if rgetattr(self, annealed_var) is not None:
-                    self.log_writer.add_scalar('%s/%s' % (str(self.node), annealed_var.replace('.', '/')), rgetattr(self, annealed_var), self.curr_iter)
+                    self.log_writer.add_scalar('%s/%s' % (str(self.node_type), annealed_var.replace('.', '/')),
+                                               rgetattr(self, annealed_var), self.curr_iter)
 
+    def obtain_encoded_tensor_dict(self,
+                                   mode,
+                                   timestep,
+                                   timesteps_in_scene,
+                                   inputs,
+                                   inputs_st,
+                                   labels,
+                                   labels_st,
+                                   first_history_indices,
+                                   scene,
+                                   node_scene_graph_batched):
 
-    def obtain_encoded_tensor_dict(self, mode, features, labels=None, prediction_timesteps=None):
-        TD = dict()    # tensor_dict
+        tensor_dict = dict()  # tensor_dict
+        batch_size = inputs.shape[0]
 
-        if self.robot_node is not None:
-            self.robot_traj = robot_traj = features[self.robot_node]
+        #########################################
+        # Provide basic information to encoders #
+        #########################################
+        node_traj = inputs
+        node_history = inputs[:, :timestep + 1]
+        node_present_state = inputs[:, timestep]
+        node_pos = inputs[:, timestep, 0:2]
+        node_vel = inputs[:, timestep, 2:4]
 
-        self.our_traj = our_traj = features[self.node]
-        # print('our_traj', our_traj)
-        self.traj_lengths = features["traj_lengths"]
-        self.features = features
-        
-        self.connected_edge_types = self.neighbors_via_edge_type.keys()
-        
-        our_present = str(self.node) + "_present"
-        our_future = str(self.node) + "_future"
+        node_traj_st = inputs_st
+        node_history_st = inputs_st[:, :timestep + 1]
+        node_present_state_st = inputs_st[:, timestep]
+        node_pos_st = inputs_st[:, timestep, 0:2]
+        node_vel_st = inputs_st[:, timestep, 2:4]
 
-        if self.robot_node is not None:
-            robot_present = str(self.robot_node) + "_present"
-            robot_future = str(self.robot_node) + "_future"
-        
-        self.node_type_connects_to_robot = False
-        for edge_type in self.connected_edge_types:
-            if ((self.robot_node is not None) and 
-                (self.robot_node.type in edge_type) and 
-                (self.robot_node in self.neighbors_via_edge_type[edge_type])):
-                self.node_type_connects_to_robot = True
-                break
+        self.node_connects_to_robot = False
+        # if self.robot_node is not None:
+        #     self.robot_traj = robot_traj = inputs[self.robot_node]
+        #
+        #
 
-        if mode == ModeKeys.TRAIN:
-            if prediction_timesteps is None:
-                mhl, ph = self.hyperparams['minimum_history_length'], self.hyperparams['prediction_horizon']
-                self.prediction_timesteps = mhl - 1 + torch.fmod(torch.randint(low=0, 
-                                                                               high=2**31-1, 
-                                                                               size=self.traj_lengths.shape).to(self.device),
-                                                                 self.traj_lengths-mhl-ph+1).long()
-            else:
-                self.prediction_timesteps = prediction_timesteps
+        # for edge_type in self.connected_edge_types:
+        #     if ((self.robot_node is not None) and
+        #         (self.robot_node.type in edge_type) and
+        #         (self.robot_node in self.neighbors_via_edge_type[edge_type])):
+        #         self.node_connects_to_robot = True
+        #         break
 
-            if self.robot_node is not None:
-                TD[robot_present] = extract_subtensor_per_batch_element(robot_traj, self.prediction_timesteps) # [bs, state_dim]
-                # print('TD[robot_present]', TD[robot_present])
-                TD[robot_future] = torch.stack([extract_subtensor_per_batch_element(robot_traj, self.prediction_timesteps+i+1)
-                                    for i in range(self.hyperparams['prediction_horizon'])], dim=1)            # [bs, ph, state_dim]
-                # print('TD[robot_future]', TD[robot_future])
+        # if self.robot_node is not None:
+        #     tensor_dict['robot_present'] = extract_subtensor_per_batch_element(robot_traj, self.prediction_timesteps) # [bs, state_dim]
+        #     tensor_dict['robot_future'] = torch.stack([extract_subtensor_per_batch_element(robot_traj, self.prediction_timesteps+i+1)
+        #                         for i in range(self.hyperparams['prediction_horizon'])], dim=1)            # [bs, ph, state_dim]
 
-            TD[our_present] = extract_subtensor_per_batch_element(our_traj, self.prediction_timesteps) # [bs, state_dim]
-            # print('TD[our_present]', TD[our_present])
-            TD[our_future] = torch.stack([extract_subtensor_per_batch_element(labels, self.prediction_timesteps+i+1)
-                                    for i in range(self.hyperparams['prediction_horizon'])], dim=1)    # [bs, ph, state_dim]
-            # print('TD[our_future]', TD[our_future])
+        ##################
+        # Encode History #
+        ##################
+        tensor_dict['node_history_encoded'] = self.encode_node_history(mode, node_traj, first_history_indices, timestep)
 
-        elif mode == ModeKeys.EVAL:
-            if self.robot_node is not None:
-                TD[robot_present] = self.extract_ragged_subarray(robot_traj)                                  # [nbs, state_dim]
-                TD[robot_future] = torch.stack([self.extract_ragged_subarray(robot_traj, i+1)
-                                              for i in range(self.hyperparams['prediction_horizon'])], dim=1) # [nbs, ph, state_dim]
+        ##################
+        # Encode Present #
+        ##################
+        tensor_dict['node_present'] = node_traj_st[:, timestep]  # [bs, state_dim]
 
-            TD[our_present] = self.extract_ragged_subarray(our_traj)                                      # [nbs, state_dim]
-            TD[our_future] = torch.stack([self.extract_ragged_subarray(labels, i+1)
-                                          for i in range(self.hyperparams['prediction_horizon'])], dim=1) # [nbs, ph, state_dim]
+        ##################
+        # Encode Future #
+        ##################
+        if mode != ModeKeys.PREDICT:
+            tensor_dict['node_future'] = labels_st[:, timestep + 1:timestep + self.ph + 1]  # [bs, ph, state_dim]
 
-        elif mode == ModeKeys.PREDICT:
-            if self.robot_node is not None:
-                TD[robot_present] = self.extract_subarray_ends(robot_traj) # [bs, state_dim]
-                TD[robot_future] = features[robot_future]                  # [bs, ph, state_dim]
+        # if self.robot_node is not None:
+        #     tensor_dict['joint_present'] = torch.cat([tensor_dict[robot_present], our_prediction_present], dim=1) # [bs/nbs, state_dim+pred_dim]
+        # else:
 
-            TD[our_present] = self.extract_subarray_ends(our_traj)         # [bs, state_dim]
+        #######################################
+        # Encode Joint Present (Robot + Node) #
+        #######################################
+        tensor_dict['joint_present'] = node_vel_st  # [bs/nbs, pred_dim]
 
-        our_prediction_present = TD[our_present][:,self.hyperparams['pred_indices']]            # [bs/nbs, pred_dim]
-        if self.robot_node is not None:
-            TD["joint_present"] = torch.cat([TD[robot_present], our_prediction_present], dim=1) # [bs/nbs, state_dim+pred_dim]
-        else:
-            TD["joint_present"] = our_prediction_present                                        # [bs/nbs, pred_dim]
+        ##############################
+        # Encode Node Edges per Type #
+        ##############################
+        tensor_dict["node_edges_encoded"] = list()
+        for edge_type in scene.get_edge_types():
+            connected_nodes_batched = list()
+            edge_masks_batched = list()
+            for i, (node, scene_graph) in enumerate(node_scene_graph_batched):
+                # We get all nodes which are connected to the current node for the current timestep
+                connected_nodes_batched.append(scene_graph.neigbors_via_edge_type[node][edge_type])
 
-        # Node History
-        TD["history_encoder"] = self.encode_node_history(mode)
-        # print('TD["history_encoder"]', TD["history_encoder"])
-        batch_size = TD["history_encoder"].size()[0]
-        
-        # Node Edges
-        # print('obtain_encoded_tensor_dict', self.node)
-        # print('obtain_encoded_tensor_dict', self.connected_edge_types)
-        TD["edge_encoders"] = [self.encode_edge(mode, edge_type, self.neighbors_via_edge_type[edge_type]) 
-                                   for edge_type in self.connected_edge_types] # List of [bs/nbs, enc_rnn_dim]
-        TD["total_edge_influence"] = self.encode_total_edge_influence(TD["edge_encoders"], TD["history_encoder"], batch_size, mode) # [bs/nbs, 4*enc_rnn_dim]
+                if self.hyperparams['dynamic_edges'] == 'yes':
+                    # We get the edge masks for the current node at the current timestep
+                    edge_masks_for_node = scene_graph.get_edge_scaling(scene_graph.current_t,
+                                                                       self.hyperparams['edge_addition_filter'],
+                                                                       self.hyperparams['edge_removal_filter'],
+                                                                       node)
+                    edge_masks_batched.append(torch.tensor(edge_masks_for_node).float().to(self.device))
+
+            # Encode edges for given edge type
+            encoded_edges_type = self.encode_edge(mode,
+                                                  node_history_st,
+                                                  edge_type,
+                                                  connected_nodes_batched,
+                                                  edge_masks_batched,
+                                                  first_history_indices,
+                                                  timestep,
+                                                  timesteps_in_scene,
+                                                  scene)
+            tensor_dict["node_edges_encoded"].append(encoded_edges_type)  # List of [bs/nbs, enc_rnn_dim]
+
+        #####################
+        # Encode Node Edges #
+        #####################
+        tensor_dict["total_edge_influence"] = self.encode_total_edge_influence(mode,
+                                                                               tensor_dict["node_edges_encoded"],
+                                                                               tensor_dict["node_history_encoded"],
+                                                                               batch_size)  # [bs/nbs, 4*enc_rnn_dim]
 
         # Tiling for multiple samples
         if mode == ModeKeys.PREDICT and self.robot_node is not None:
             # This tiling is done because:
             #   a) we must consider the prediction case where there are many candidate robot future actions,
             #   b) the edge and history encoders are all the same regardless of which candidate future robot action we're evaluating.
-            TD["joint_present"] = TD["joint_present"].repeat(features[robot_future].size()[0], 1)
-            TD[robot_present] = TD[robot_present].repeat(features[robot_future].size()[0], 1)
-            TD["history_encoder"] = TD["history_encoder"].repeat(features[robot_future].size()[0], 1)
-            TD["total_edge_influence"] = TD["total_edge_influence"].repeat(features[robot_future].size()[0], 1)
-            
-            # Changing it here because we're repeating all our tensors by the number of samples.
-            batch_size = TD["history_encoder"].size()[0]
+            tiling_vals = ['joint_present', robot_present, 'history_encoder', 'total_edge_influence']
 
+            for val_to_tile in tiling_vals:
+                tensor_dict[val_to_tile] = tensor_dict[val_to_tile].repeat(inputs[robot_future].size()[0], 1)
+
+            # Changing it here because we're repeating all our tensors by the number of samples.
+            batch_size = tensor_dict["history_encoder"].size()[0]
+
+        ######################################
+        # Concatenate Encoder Outputs into x #
+        ######################################
         concat_list = list()
-        
+
         # Every node has an edge-influence encoder (which could just be zero).
-        concat_list.append(TD["total_edge_influence"])  # [bs/nbs, 4*enc_rnn_dim]
+        concat_list.append(tensor_dict["total_edge_influence"])  # [bs/nbs, 4*enc_rnn_dim]
 
         # Every node has a history encoder.
-        concat_list.append(TD["history_encoder"])       # [bs/nbs, enc_rnn_dim_history]
+        concat_list.append(tensor_dict["node_history_encoded"])  # [bs/nbs, enc_rnn_dim_history]
 
-        if self.node_type_connects_to_robot:
-            TD[self.robot_node.type + "_robot_future_encoder"] = self.encode_robot_future(TD[robot_present], 
-                                                                                          TD[robot_future],
-                                                                                          mode, 
-                                                                                          self.robot_node.type + '_robot') 
-                                                                                          # [bs/nbs, 4*enc_rnn_dim_future]
-            concat_list.append(TD[self.robot_node.type + "_robot_future_encoder"])   
+        if self.node_connects_to_robot:
+            tensor_dict[self.robot_node.type + "_robot_future_encoder"] = self.encode_robot_future(
+                tensor_dict[robot_present],
+                tensor_dict[robot_future],
+                mode,
+                self.robot_node.type + '_robot')
+            # [bs/nbs, 4*enc_rnn_dim_future]
+            concat_list.append(tensor_dict[self.robot_node.type + "_robot_future_encoder"])
 
         elif self.robot_node is not None:
             # Four times because we're trying to mimic a bi-directional RNN's output (which is c and h from both ends).
-            concat_list.append(torch.zeros([batch_size, 4*self.hyperparams['enc_rnn_dim_future']], device=self.device))
+            concat_list.append(
+                torch.zeros([batch_size, 4 * self.hyperparams['enc_rnn_dim_future']], device=self.device))
 
-        # print('self.node_type_connects_to_robot', self.node_type_connects_to_robot)
-        # print('edges', self.scene_graph.node_edges_and_neighbors[self.node])
-        TD["x"] = torch.cat(concat_list, dim=1) # [bs/nbs, 4*enc_rnn_dim + enc_rnn_dim_history + 4*enc_rnn_dim_future (only if robot_node is not None)]
+        tensor_dict["x"] = torch.cat(concat_list,
+                                     dim=1)  # [bs/nbs, 4*enc_rnn_dim + enc_rnn_dim_history + 4*enc_rnn_dim_future (only if robot_node is not None)]
 
         if mode == ModeKeys.TRAIN or mode == ModeKeys.EVAL:
-            TD[self.node.type + "_future_encoder"] = self.encode_node_future(TD[our_present], 
-                                                                             TD[our_future], 
-                                                                             mode, 
-                                                                             self.node.type) # [bs/nbs, 4*enc_rnn_dim_future]
+            tensor_dict[self.node_type + "_future_encoder"] = self.encode_node_future(tensor_dict['node_present'],
+                                                                                      tensor_dict['node_future'],
+                                                                                      mode,
+                                                                                      self.node_type)  # [bs/nbs, 4*enc_rnn_dim_future]
 
-        return TD
+        return tensor_dict
 
-
-    def encode_node_history(self, mode):
-        node_history = self.our_traj
-        # node_history = F.dropout(self.our_traj,
-        #                          p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-        #                          training=(mode == ModeKeys.TRAIN))
-        if mode == ModeKeys.TRAIN:
-            outputs, _ = run_lstm_on_variable_length_seqs(self.node_modules[self.node.type + '/node_history_encoder'],
-                                                          node_history,
-                                                          self.prediction_timesteps)
-        else:
-            outputs, _ = self.node_modules[self.node.type + '/node_history_encoder'](node_history)
+    def encode_node_history(self, mode, node_traj, first_history_indices, timestep):
+        outputs, _ = run_lstm_on_variable_length_seqs(self.node_modules[self.node_type + '/node_history_encoder'],
+                                                      node_traj,
+                                                      torch.ones_like(first_history_indices) * timestep,
+                                                      first_history_indices,
+                                                      self.hyperparams[
+                                                          'maximum_history_length'] + 1)  # history + current
 
         outputs = F.dropout(outputs,
-                            p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                            training=(mode == ModeKeys.TRAIN)) # [bs, max_time, enc_rnn_dim]
+                            p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                            training=(mode == ModeKeys.TRAIN))  # [bs, max_time, enc_rnn_dim]
 
-        if mode == ModeKeys.TRAIN:
-            return extract_subtensor_per_batch_element(outputs, self.prediction_timesteps) # [bs, enc_rnn_dim]
-        elif mode == ModeKeys.EVAL:
-            return self.extract_ragged_subarray(outputs) # [nbs, enc_rnn_dim]
-        elif mode == ModeKeys.PREDICT:
-            return self.extract_subarray_ends(outputs)   # [bs, enc_rnn_dim]
+        last_index_per_sequence = timestep - first_history_indices
 
+        return outputs[torch.arange(first_history_indices.shape[0]), last_index_per_sequence]
 
-    def encode_edge(self, mode, edge_type, connected_nodes):        
-        input_feature_list = [self.features[node] for node in connected_nodes]
-        stacked_edge_states = torch.stack(input_feature_list, dim=0)
+    def encode_edge(self,
+                    mode,
+                    node_history,
+                    edge_type,
+                    connected_nodes,
+                    edge_masks,
+                    first_history_indices,
+                    timestep,
+                    timesteps_in_scene,
+                    scene):
 
-        if self.dynamic_edges == 'yes':
-            node_idx = self.scene_graph.nodes.index(self.node)
-            connected_node_idxs = [self.scene_graph.nodes.index(node) for node in connected_nodes]
-            edge_mask = torch.stack([self.features["edge_scaling_mask"][:, :, connected_node_idxs[i], node_idx]
-                                        for i in range(len(connected_node_idxs))],
-                                    dim=2)
+        max_hl = self.hyperparams['maximum_history_length']
 
-        if self.edge_state_combine_method == 'sum':
+        edge_states_list = list()  # list of [#of neighbors, max_hl, state_dim]
+        for i, timestep_in_scene in enumerate(timesteps_in_scene):  # Get neighbors for timestep in batch
+            neighbor_states = list()
+            for node in connected_nodes[i]:
+                neighbor_state_np = node.get(np.array([timestep_in_scene - max_hl, timestep_in_scene]),
+                                             self.state, self.dims,
+                                             padding=0.0)
+                neighbor_state_np_st = scene.standardize(neighbor_state_np, self.state, self.dims)
+                neighbor_state = torch.tensor(neighbor_state_np_st).float().to(self.device)
+                neighbor_states.append(neighbor_state)
+            if len(neighbor_states) == 0:  # There are no neighbors for edge type # TODO necessary?
+                edge_states_list.append(torch.zeros((1, max_hl + 1, self.state_dim), device=self.device))
+            else:
+                edge_states_list.append(torch.stack(neighbor_states, dim=0))
+
+        if self.hyperparams['edge_state_combine_method'] == 'sum':
             # Used in Structural-RNN to combine edges as well.
-            combined_neighbors = torch.sum(stacked_edge_states, dim=0)
-            if self.dynamic_edges == 'yes':
+            op_applied_edge_states_list = list()
+            for neighbors_state in edge_states_list:
+                op_applied_edge_states_list.append(torch.sum(neighbors_state, dim=0))
+            combined_neighbors = torch.stack(op_applied_edge_states_list, dim=0)
+            if self.hyperparams['dynamic_edges'] == 'yes':
                 # Should now be (bs, time, 1)
-                edge_mask = torch.clamp(torch.sum(edge_mask, dim=2, keepdim=True), max=1.)
-            
-        elif self.edge_state_combine_method == 'max':
+                op_applied_edge_mask_list = list()
+                for edge_mask in edge_masks:
+                    op_applied_edge_mask_list.append(torch.clamp(torch.sum(edge_mask, dim=0, keepdim=True), max=1.))
+                combined_edge_masks = torch.stack(op_applied_edge_mask_list, dim=0)
+
+        elif self.hyperparams['edge_state_combine_method'] == 'max':
             # Used in NLP, e.g. max over word embeddings in a sentence.
-            combined_neighbors = torch.max(stacked_edge_states, dim=0)
-            if self.dynamic_edges == 'yes':
+            op_applied_edge_states_list = list()
+            for neighbors_state in edge_states_list:
+                op_applied_edge_states_list.append(torch.max(neighbors_state, dim=0))
+            combined_neighbors = torch.stack(op_applied_edge_states_list, dim=0)
+            if self.hyperparams['dynamic_edges'] == 'yes':
                 # Should now be (bs, time, 1)
-                edge_mask = torch.clamp(torch.max(edge_mask, dim=2, keepdim=True)[0], max=1.)
-            
-        elif self.edge_state_combine_method == 'mean':
+                op_applied_edge_mask_list = list()
+                for edge_mask in edge_masks:
+                    op_applied_edge_mask_list.append(torch.clamp(torch.max(edge_mask, dim=0, keepdim=True), max=1.))
+                combined_edge_masks = torch.stack(op_applied_edge_mask_list, dim=0)
+
+        elif self.hyperparams['edge_state_combine_method'] == 'mean':
             # Used in NLP, e.g. mean over word embeddings in a sentence.
-            combined_neighbors = torch.mean(stacked_edge_states, dim=0)
-            if self.dynamic_edges == 'yes':
+            op_applied_edge_states_list = list()
+            for neighbors_state in edge_states_list:
+                op_applied_edge_states_list.append(torch.mean(neighbors_state, dim=0))
+            combined_neighbors = torch.stack(op_applied_edge_states_list, dim=0)
+            if self.hyperparams['dynamic_edges'] == 'yes':
                 # Should now be (bs, time, 1)
-                edge_mask = torch.clamp(torch.mean(edge_mask, dim=2, keepdim=True), max=1.)
+                op_applied_edge_mask_list = list()
+                for edge_mask in edge_masks:
+                    op_applied_edge_mask_list.append(torch.clamp(torch.mean(edge_mask, dim=0, keepdim=True), max=1.))
+                combined_edge_masks = torch.stack(op_applied_edge_mask_list, dim=0)
 
-        elif self.edge_state_combine_method == 'attention':
-            # Used in Social Attention (https://arxiv.org/abs/1710.04689)
-            stacked_edge_states = torch.transpose(stacked_edge_states, 0, 1)
+        joint_history = torch.cat([combined_neighbors, node_history], dim=-1)
 
-            # combined_neighbors will have a shape of (batch, max_time, enc_dim)
-            # attention_probs will have a shape of (batch, num_enc_states, max_time, 1)
-            combined_neighbors, attention_probs = self.node_modules[self.node.type + '/edge_attention_combine'](stacked_edge_states, self.our_traj)
-            combined_neighbors = F.dropout(combined_neighbors,
-                                           p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                                           training=(mode == ModeKeys.TRAIN))
-
-            if self.dynamic_edges == 'yes':
-                # Should now be (bs, time, 1)
-                edge_mask = torch.sum(edge_mask*attention_probs, dim=2, keepdim=True)
-
-        elif self.edge_state_combine_method == 'pointnet':
-            # Used in PointNet (https://arxiv.org/pdf/1612.00593.pdf)
-            # First a simple ReLU-MLP ...
-            combined_neighbors = self.node_modules[edge_type + '/pointnet_encoder'](stacked_edge_states)
-            # ... followed by max pooling.
-            combined_neighbors = torch.max(combined_neighbors, dim=0)[0]
-            
-            if self.dynamic_edges == 'yes':
-                # Should now be (bs, time, 1)
-                edge_mask = torch.clamp(torch.max(edge_mask, dim=2, keepdim=True)[0], max=1.)
-
-        joint_history = torch.cat([combined_neighbors, self.our_traj], dim=2)
-        # joint_history = F.dropout(joint_history,
-        #                           p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-        #                           training=(mode == ModeKeys.TRAIN))
-        if mode == ModeKeys.TRAIN:
-            outputs, _ = run_lstm_on_variable_length_seqs(self.node_modules[edge_type + '/edge_encoder'],
-                                                          joint_history,
-                                                          self.prediction_timesteps)
-        else:
-            outputs, _ = self.node_modules[edge_type + '/edge_encoder'](joint_history)
+        outputs, _ = run_lstm_on_variable_length_seqs(self.node_modules[edge_type + '/edge_encoder'],
+                                                      joint_history,
+                                                      torch.ones_like(first_history_indices) * timestep,
+                                                      first_history_indices,
+                                                      self.hyperparams[
+                                                          'maximum_history_length'] + 1)  # Add prediction timestep
 
         outputs = F.dropout(outputs,
-                            p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                            training=(mode == ModeKeys.TRAIN)) # [bs, max_time, enc_rnn_dim]
-        
-        if mode == ModeKeys.TRAIN:
-            if self.dynamic_edges == 'yes':
-                return extract_subtensor_per_batch_element(outputs, self.prediction_timesteps) * extract_subtensor_per_batch_element(edge_mask, self.prediction_timesteps)
-            else:
-                return extract_subtensor_per_batch_element(outputs, self.prediction_timesteps)
-        elif mode == ModeKeys.EVAL:
-            if self.dynamic_edges == 'yes':
-                return self.extract_ragged_subarray(outputs) * self.extract_ragged_subarray(edge_mask)
-            else:
-                return self.extract_ragged_subarray(outputs) # [nbs, enc_rnn_dim]
-        elif mode == ModeKeys.PREDICT:
-            if self.dynamic_edges == 'yes':
-                return self.extract_subarray_ends(outputs) * self.extract_subarray_ends(edge_mask)
-            else:
-                return self.extract_subarray_ends(outputs)   # [bs, enc_rnn_dim]
-    
+                            p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                            training=(mode == ModeKeys.TRAIN))  # [bs, max_time, enc_rnn_dim]
 
-    def encode_total_edge_influence(self, encoded_edges, node_history_encoder, batch_size, mode):
-        if self.edge_influence_combine_method == 'sum':
+        last_index_per_sequence = timestep - first_history_indices
+        ret = outputs[torch.arange(last_index_per_sequence.shape[0]), last_index_per_sequence]
+        if self.hyperparams['dynamic_edges'] == 'yes':
+            return ret * combined_edge_masks
+        else:
+            return ret
+
+    def encode_total_edge_influence(self, mode, encoded_edges, node_history_encoder, batch_size):
+        if self.hyperparams['edge_influence_combine_method'] == 'sum':
             stacked_encoded_edges = torch.stack(encoded_edges, dim=0)
             combined_edges = torch.sum(stacked_encoded_edges, dim=0)
-            
-        elif self.edge_influence_combine_method == 'mean':
+
+        elif self.hyperparams['edge_influence_combine_method'] == 'mean':
             stacked_encoded_edges = torch.stack(encoded_edges, dim=0)
             combined_edges = torch.mean(stacked_encoded_edges, dim=0)
-            
-        elif self.edge_influence_combine_method == 'max':
+
+        elif self.hyperparams['edge_influence_combine_method'] == 'max':
             stacked_encoded_edges = torch.stack(encoded_edges, dim=0)
             combined_edges = torch.max(stacked_encoded_edges, dim=0)
-            
-        elif self.edge_influence_combine_method == 'bi-rnn':
+
+        elif self.hyperparams['edge_influence_combine_method'] == 'bi-rnn':
             if len(encoded_edges) == 0:
                 combined_edges = torch.zeros((batch_size, self.eie_output_dims), device=self.device)
-            
+
             else:
                 # axis=1 because then we get size [batch_size, max_time, depth]
                 encoded_edges = torch.stack(encoded_edges, dim=1)
 
-                # encoded_edges = F.dropout(encoded_edges,
-                #                   p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                #                   training=(mode == ModeKeys.TRAIN))
-                _, state = self.node_modules[self.node.type + '/edge_influence_encoder'](encoded_edges)
+                _, state = self.node_modules[self.node_type + '/edge_influence_encoder'](encoded_edges)
                 combined_edges = unpack_RNN_state(state)
                 combined_edges = F.dropout(combined_edges,
-                                  p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                                  training=(mode == ModeKeys.TRAIN))
-        
-        elif self.edge_influence_combine_method == 'attention':
+                                           p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                                           training=(mode == ModeKeys.TRAIN))
+
+        elif self.hyperparams['edge_influence_combine_method'] == 'attention':
             # Used in Social Attention (https://arxiv.org/abs/1710.04689)
             if len(encoded_edges) == 0:
                 combined_edges = torch.zeros((batch_size, self.eie_output_dims), device=self.device)
@@ -597,18 +617,18 @@ class MultimodalGenerativeCVAE(object):
             else:
                 # axis=1 because then we get size [batch_size, max_time, depth]
                 encoded_edges = torch.stack(encoded_edges, dim=1)
-                combined_edges, _ = self.node_modules[self.node.type + '/edge_influence_encoder'](encoded_edges, node_history_encoder)
+                combined_edges, _ = self.node_modules[self.node_type + '/edge_influence_encoder'](encoded_edges,
+                                                                                                  node_history_encoder)
                 combined_edges = F.dropout(combined_edges,
-                                  p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-                                  training=(mode == ModeKeys.TRAIN))
+                                           p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                                           training=(mode == ModeKeys.TRAIN))
 
         return combined_edges
 
-
     def encode_node_future(self, node_present, node_future, mode, scope):
-        initial_h_model = self.node_modules[self.node.type + '/node_future_encoder/initial_h']
-        initial_c_model = self.node_modules[self.node.type + '/node_future_encoder/initial_c']
-        
+        initial_h_model = self.node_modules[self.node_type + '/node_future_encoder/initial_h']
+        initial_c_model = self.node_modules[self.node_type + '/node_future_encoder/initial_c']
+
         # Here we're initializing the forward hidden states,
         # but zeroing the backward ones.
         initial_h = initial_h_model(node_present)
@@ -619,22 +639,18 @@ class MultimodalGenerativeCVAE(object):
 
         initial_state = (initial_h, initial_c)
 
-        # node_future = F.dropout(node_future,
-        #                         p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-        #                         training=(mode == ModeKeys.TRAIN))
-        _, state = self.node_modules[self.node.type + '/node_future_encoder'](node_future, initial_state)
+        _, state = self.node_modules[self.node_type + '/node_future_encoder'](node_future, initial_state)
         state = unpack_RNN_state(state)
         state = F.dropout(state,
-                          p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                          p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
                           training=(mode == ModeKeys.TRAIN))
 
         return state
 
-
     def encode_robot_future(self, robot_present, robot_future, mode, scope):
         initial_h_model = self.node_modules['robot_future_encoder/initial_h']
         initial_c_model = self.node_modules['robot_future_encoder/initial_c']
-        
+
         # Here we're initializing the forward hidden states,
         # but zeroing the backward ones.
         initial_h = initial_h_model(robot_present)
@@ -645,154 +661,121 @@ class MultimodalGenerativeCVAE(object):
 
         initial_state = (initial_h, initial_c)
 
-        # robot_future = F.dropout(robot_future,
-        #                         p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
-        #                         training=(mode == ModeKeys.TRAIN))
         _, state = self.node_modules['robot_future_encoder'](robot_future, initial_state)
         state = unpack_RNN_state(state)
         state = F.dropout(state,
-                          p=1.-self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
+                          p=1. - self.hyperparams['rnn_kwargs']['dropout_keep_prob'],
                           training=(mode == ModeKeys.TRAIN))
 
         return state
 
-
-    # Creates a new batch size "nbs"
-    def extract_ragged_subarray(self, tensor, offset=0):
-        mhl, ph = self.hyperparams['minimum_history_length'], self.hyperparams['prediction_horizon']
-        mask = torch.zeros((tensor.size()[0], tensor.size()[1], 1), dtype=torch.uint8, device=self.device)
-        last_timesteps = (self.traj_lengths - ph + offset).long()
-        for i, last_timestep in enumerate(last_timesteps):
-            mask[i, :last_timestep] = 1
-
-        selection = torch.masked_select(tensor[:, mhl-1+offset:], mask[:, mhl-1+offset:])
-        return torch.reshape(selection, (-1, tensor.size()[-1]))
-
-
-    def extract_subarray_ends(self, tensor, offset=0):
-        return extract_subtensor_per_batch_element(tensor, self.traj_lengths.long()+offset)
-
-
     def q_z_xy(self, x, y, mode):
         xy = torch.cat([x, y], dim=1)
-        # print('q_z_xy/xy', xy)
 
         if self.hyperparams['q_z_xy_MLP_dims'] is not None:
-            dense = self.node_modules[self.node.type + '/q_z_xy']
-            h = F.dropout(F.relu(dense(xy)), 
-                          p=1.-self.hyperparams['MLP_dropout_keep_prob'],
+            dense = self.node_modules[self.node_type + '/q_z_xy']
+            h = F.dropout(F.relu(dense(xy)),
+                          p=1. - self.hyperparams['MLP_dropout_keep_prob'],
                           training=(mode == ModeKeys.TRAIN))
 
         else:
             h = xy
 
-        to_latent = self.node_modules[self.node.type + '/hxy_to_z']
-
-        # if self.log_writer is not None:
-        #     self.log_writer.add_scalar('%s/%s' % (str(self.node), 'latent/z_logit_clip'), self.latent.z_logit_clip, self.curr_iter)
-
-        # print('q_z_xy/h', h)
+        to_latent = self.node_modules[self.node_type + '/hxy_to_z']
         return self.latent.dist_from_h(to_latent(h), mode)
-
 
     def p_z_x(self, x, mode):
         if self.hyperparams['p_z_x_MLP_dims'] is not None:
-            dense = self.node_modules[self.node.type + '/p_z_x']
+            dense = self.node_modules[self.node_type + '/p_z_x']
             h = F.dropout(F.relu(dense(x)),
-                          p=1.-self.hyperparams['MLP_dropout_keep_prob'],
+                          p=1. - self.hyperparams['MLP_dropout_keep_prob'],
                           training=(mode == ModeKeys.TRAIN))
 
         else:
             h = x
 
-        to_latent = self.node_modules[self.node.type + '/hx_to_z']
-        # print('p_z_x/h', h)
+        to_latent = self.node_modules[self.node_type + '/hx_to_z']
         return self.latent.dist_from_h(to_latent(h), mode)
 
-
     def project_to_GMM_params(self, tensor):
-        log_pis = self.node_modules[self.node.type + '/decoder/proj_to_GMM_log_pis'](tensor)
-        mus = self.node_modules[self.node.type + '/decoder/proj_to_GMM_mus'](tensor)
-        log_sigmas = self.node_modules[self.node.type + '/decoder/proj_to_GMM_log_sigmas'](tensor)
-        corrs = torch.tanh(self.node_modules[self.node.type + '/decoder/proj_to_GMM_corrs'](tensor))
+        log_pis = self.node_modules[self.node_type + '/decoder/proj_to_GMM_log_pis'](tensor)
+        mus = self.node_modules[self.node_type + '/decoder/proj_to_GMM_mus'](tensor)
+        log_sigmas = self.node_modules[self.node_type + '/decoder/proj_to_GMM_log_sigmas'](tensor)
+        corrs = torch.tanh(self.node_modules[self.node_type + '/decoder/proj_to_GMM_corrs'](tensor))
         return log_pis, mus, log_sigmas, corrs
 
-
-    def p_y_xz(self, x, z_stacked, TD, mode,
-               num_predicted_timesteps, num_samples,
-               most_likely=False):
+    def p_y_xz(self, x, z_stacked, tensor_dict, mode,
+               num_predicted_timesteps, num_samples_z, num_samples_gmm=1):
         ph = num_predicted_timesteps
-        sample_ct = num_samples
 
-        our_future = str(self.node) + "_future"
+        our_future = "node_future"
         if self.robot_node is not None:
             robot_future = str(self.robot_node) + "_future"
 
-        k, GMM_c, pred_dim = sample_ct, self.hyperparams['GMM_components'], self.hyperparams['pred_dim']
+        k = num_samples_z * num_samples_gmm
+        GMM_c, pred_dim = self.hyperparams['GMM_components'], len(self.dims)
 
         z = torch.reshape(z_stacked, (-1, self.latent.z_dim))
         zx = torch.cat([z, x.repeat(k, 1)], dim=1)
 
-        cell = self.node_modules[self.node.type + '/decoder/lstm_cell']
-        initial_h_model = self.node_modules[self.node.type + '/decoder/initial_h']
-        initial_c_model = self.node_modules[self.node.type + '/decoder/initial_c']
+        cell = self.node_modules[self.node_type + '/decoder/lstm_cell']
+        initial_h_model = self.node_modules[self.node_type + '/decoder/initial_h']
+        initial_c_model = self.node_modules[self.node_type + '/decoder/initial_c']
 
         initial_state = (initial_h_model(zx), initial_c_model(zx))
-        
+
         log_pis, mus, log_sigmas, corrs = [], [], [], []
         if mode in [ModeKeys.TRAIN, ModeKeys.EVAL]:
             state = initial_state
             if self.hyperparams['sample_model_during_dec'] and mode == ModeKeys.TRAIN:
-                input_ = torch.cat([zx, TD['joint_present'].repeat(k, 1)], dim=1)
+                input_ = torch.cat([zx, tensor_dict['joint_present'].repeat(k, 1)], dim=1)
                 for j in range(ph):
                     h_state, c_state = cell(input_, state)
-                    log_pi_t, mu_t, log_sigma_t, corr_t = self.project_to_GMM_params(h_state) 
+                    log_pi_t, mu_t, log_sigma_t, corr_t = self.project_to_GMM_params(h_state)
                     y_t = GMM2D(log_pi_t, mu_t, log_sigma_t, corr_t, self.hyperparams, self.device,
-                                self.hyperparams['log_sigma_min'], self.hyperparams['log_sigma_max']).sample()              # [k;bs, pred_dim]
-                    
+                                self.hyperparams['log_sigma_min'],
+                                self.hyperparams['log_sigma_max']).sample()  # [k;bs, pred_dim]
+
                     # This is where we pick our output y_t or the true output
                     # our_future to pass into the next cell (we do this with
                     # probability self.dec_sample_model_prob and is only done
                     # during training).
                     mask = td.Bernoulli(probs=self.dec_sample_model_prob).sample((y_t.size()[0], 1))
+                    y_t = mask * y_t + (1 - mask) * (tensor_dict[our_future][:, j, :].repeat(k, 1))
 
-                    # if self.log_writer is not None:
-                    #     self.log_writer.add_scalar('%s/%s' % (str(self.node), 'dec_sample_model_prob'), self.dec_sample_model_prob, self.curr_iter)
-
-                    y_t = mask*y_t + (1 - mask)*(TD[our_future][:,j,:].repeat(k, 1))
-                    
                     log_pis.append(log_pi_t)
                     mus.append(mu_t)
                     log_sigmas.append(log_sigma_t)
                     corrs.append(corr_t)
 
                     if self.robot_node is not None:
-                        dec_inputs = torch.cat([TD[robot_future][:,j,:].repeat(k, 1), y_t], dim=1)
+                        dec_inputs = torch.cat([tensor_dict[robot_future][:, j, :].repeat(k, 1), y_t], dim=1)
                     else:
                         dec_inputs = y_t
 
                     input_ = torch.cat([zx, dec_inputs], dim=1)
                     state = (h_state, c_state)
-                
+
                 log_pis = torch.stack(log_pis, dim=1)
                 mus = torch.stack(mus, dim=1)
                 log_sigmas = torch.stack(log_sigmas, dim=1)
                 corrs = torch.stack(corrs, dim=1)
 
             else:
-                zx_with_time_dim = zx.unsqueeze(dim=1)                           # [k;bs/nbs, 1, N*K + 2*enc_rnn_dim]
-                zx_time_tiled = zx_with_time_dim.repeat(1, ph, 1) 
+                zx_with_time_dim = zx.unsqueeze(dim=1)  # [k;bs/nbs, 1, N*K + 2*enc_rnn_dim]
+                zx_time_tiled = zx_with_time_dim.repeat(1, ph, 1)
                 if self.robot_node is not None:
                     dec_inputs = torch.cat([
-                        TD["joint_present"].unsqueeze(dim=1),
-                        torch.cat([TD[robot_future][:,:ph-1,:], TD[our_future][:, :ph-1,:]], dim=2)
-                        ], dim=1)
+                        tensor_dict["joint_present"].unsqueeze(dim=1),
+                        torch.cat([tensor_dict[robot_future][:, :ph - 1, :], tensor_dict[our_future][:, :ph - 1, :]],
+                                  dim=2)
+                    ], dim=1)
                 else:
                     dec_inputs = torch.cat([
-                        TD["joint_present"].unsqueeze(dim=1), 
-                        TD[our_future][:, :ph-1,:]
-                        ], dim=1)
-                
+                        tensor_dict["joint_present"].unsqueeze(dim=1),
+                        tensor_dict[our_future][:, :ph - 1, :]
+                    ], dim=1)
+
                 inputs = torch.cat([zx_time_tiled, dec_inputs.repeat(k, 1, 1)], dim=2)
                 outputs = list()
                 for j in range(ph):
@@ -804,23 +787,25 @@ class MultimodalGenerativeCVAE(object):
                 log_pis, mus, log_sigmas, corrs = self.project_to_GMM_params(outputs)
 
             if self.log_writer is not None:
-                self.log_writer.add_histogram('%s/%s' % (str(self.node), 'GMM_log_pis'), log_pis, self.curr_iter)
-                self.log_writer.add_histogram('%s/%s' % (str(self.node), 'GMM_mus'), mus, self.curr_iter)
-                self.log_writer.add_histogram('%s/%s' % (str(self.node), 'GMM_log_sigmas'), log_sigmas, self.curr_iter)
-                self.log_writer.add_histogram('%s/%s' % (str(self.node), 'GMM_corrs'), corrs, self.curr_iter)
+                self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'GMM_log_pis'), log_pis, self.curr_iter)
+                self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'GMM_mus'), mus, self.curr_iter)
+                self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'GMM_log_sigmas'), log_sigmas,
+                                              self.curr_iter)
+                self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'GMM_corrs'), corrs, self.curr_iter)
 
         elif mode == ModeKeys.PREDICT:
-            input_ = torch.cat([zx, TD["joint_present"].repeat(k, 1)], dim=1)
+            input_ = torch.cat([zx, tensor_dict["joint_present"].repeat(k, 1)], dim=1)
             state = initial_state
 
             log_pis, mus, log_sigmas, corrs, y = [], [], [], [], []
             for j in range(ph):
                 h_state, c_state = cell(input_, state)
                 log_pi_t, mu_t, log_sigma_t, corr_t = self.project_to_GMM_params(h_state)
-                
+
                 y_t = GMM2D(log_pi_t, mu_t, log_sigma_t, corr_t, self.hyperparams, self.device,
-                            self.hyperparams['log_sigma_min'], self.hyperparams['log_sigma_max']).sample()              # [k;bs, pred_dim]
-                
+                            self.hyperparams['log_sigma_min'],
+                            self.hyperparams['log_sigma_max']).sample()  # [k;bs, pred_dim]
+
                 log_pis.append(log_pi_t)
                 mus.append(mu_t)
                 log_sigmas.append(log_sigma_t)
@@ -828,7 +813,7 @@ class MultimodalGenerativeCVAE(object):
                 y.append(y_t)
 
                 if self.robot_node is not None:
-                    dec_inputs = torch.cat([TD[robot_future][:,j,:].repeat(k, 1), y_t], dim=1)
+                    dec_inputs = torch.cat([tensor_dict[robot_future][:, j, :].repeat(k, 1), y_t], dim=1)
                 else:
                     dec_inputs = y_t
 
@@ -839,11 +824,11 @@ class MultimodalGenerativeCVAE(object):
             mus = torch.stack(mus, dim=1)
             log_sigmas = torch.stack(log_sigmas, dim=1)
             corrs = torch.stack(corrs, dim=1)
-            sampled_future = torch.reshape(torch.stack(y, dim=1), (k, -1, ph, pred_dim))
+            sampled_future = torch.reshape(torch.stack(y, dim=1), (num_samples_z, num_samples_gmm, -1, ph, pred_dim))
 
         y_dist = GMM2D(torch.reshape(log_pis, [k, -1, ph, GMM_c]),
-                       torch.reshape(mus, [k, -1, ph, GMM_c*pred_dim]),
-                       torch.reshape(log_sigmas, [k, -1, ph, GMM_c*pred_dim]),
+                       torch.reshape(mus, [k, -1, ph, GMM_c * pred_dim]),
+                       torch.reshape(log_sigmas, [k, -1, ph, GMM_c * pred_dim]),
                        torch.reshape(corrs, [k, -1, ph, GMM_c]),
                        self.hyperparams, self.device,
                        self.hyperparams['log_sigma_min'], self.hyperparams['log_sigma_max'])
@@ -852,7 +837,6 @@ class MultimodalGenerativeCVAE(object):
             return y_dist, sampled_future
         else:
             return y_dist
-
 
     def encoder(self, x, y, mode, num_samples=None):
         if mode == ModeKeys.TRAIN:
@@ -864,99 +848,151 @@ class MultimodalGenerativeCVAE(object):
             if num_samples is None:
                 raise ValueError("num_samples cannot be None with mode == PREDICT.")
 
-        # print('encoder/x', x)
-        # print('encoder/y', y)
         self.latent.q_dist = self.q_z_xy(x, y, mode)
         self.latent.p_dist = self.p_z_x(x, mode)
 
-        # print('self.latent.q_dist.mean, self.latent.q_dist.variance', self.latent.q_dist.mean, self.latent.q_dist.variance)
-        # print('self.latent.p_dist.mean, self.latent.p_dist.variance', self.latent.p_dist.mean, self.latent.p_dist.variance)
         z = self.latent.sample_q(sample_ct, mode)
 
-        # if self.log_writer is not None:
-        #     self.log_writer.add_scalar('data/%s/%s' % (str(self.node), 'latent/temp'), self.latent.temp, self.curr_iter)
-
         if mode == ModeKeys.TRAIN and self.hyperparams['kl_exact']:
-            kl_obj = self.latent.kl_q_p(self.log_writer, '%s' % str(self.node), self.curr_iter)
+            kl_obj = self.latent.kl_q_p(self.log_writer, '%s' % str(self.node_type), self.curr_iter)
             if self.log_writer is not None:
-                self.log_writer.add_scalar('%s/%s' % (str(self.node), 'kl'), kl_obj, self.curr_iter)
+                self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'kl'), kl_obj, self.curr_iter)
         else:
             kl_obj = None
 
         return z, kl_obj
 
-
-    def decoder(self, x, y, z, TD, mode,
-                num_predicted_timesteps, num_samples):
-        y_dist = self.p_y_xz(x, z, TD, mode, num_predicted_timesteps, num_samples)
+    def decoder(self, x, y, z, tensor_dict, mode, num_predicted_timesteps, num_samples):
+        y_dist = self.p_y_xz(x, z, tensor_dict, mode, num_predicted_timesteps, num_samples)
         log_p_yt_xz = torch.clamp(y_dist.log_prob(y), max=self.hyperparams['log_p_yt_xz_max'])
         if self.log_writer is not None:
-            self.log_writer.add_histogram('%s/%s' % (str(self.node), 'log_p_yt_xz'), log_p_yt_xz, self.curr_iter)
-        
-        log_p_y_xz = torch.sum(log_p_yt_xz, dim=2)        
+            self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'log_p_yt_xz'), log_p_yt_xz, self.curr_iter)
+
+        log_p_y_xz = torch.sum(log_p_yt_xz, dim=2)
         return log_p_y_xz
 
+    def mutual_inf_mc(self, x_dist):
+        dist = x_dist.__class__
+        H_y = dist(probs=x_dist.probs.mean(dim=0)).entropy()
+        return (H_y - x_dist.entropy().mean(dim=0)).sum()
 
-    def train_loss(self, inputs, labels, num_predicted_timesteps, prediction_timesteps=None):
+    def train_loss(self,
+                   inputs,
+                   inputs_st,
+                   first_history_indices,
+                   labels,
+                   labels_st,
+                   scene,
+                   node_scene_graph_batched,
+                   timestep,
+                   timesteps_in_scene,
+                   prediction_horizon):
+
         mode = ModeKeys.TRAIN
 
-        TD = self.obtain_encoded_tensor_dict(mode, inputs, labels, prediction_timesteps)
+        tensor_dict = self.obtain_encoded_tensor_dict(mode,
+                                                      timestep,
+                                                      timesteps_in_scene,
+                                                      inputs,
+                                                      inputs_st,
+                                                      labels,
+                                                      labels_st,
+                                                      first_history_indices,
+                                                      scene,
+                                                      node_scene_graph_batched)
 
-        z, kl = self.encoder(TD["x"], TD[self.node.type + "_future_encoder"], mode)
-        # print('z', z)
-        # print('kl', kl)
-        log_p_y_xz = self.decoder(TD["x"], TD[str(self.node) + "_future"], z, TD, mode,
-                                  num_predicted_timesteps,
+        z, kl = self.encoder(tensor_dict["x"], tensor_dict[self.node_type + "_future_encoder"], mode)
+        log_p_y_xz = self.decoder(tensor_dict["x"], tensor_dict["node_future"], z, tensor_dict, mode,
+                                  prediction_horizon,
                                   self.hyperparams['k'])
-        # print('log_p_y_xz', log_p_y_xz)
 
         if np.abs(self.hyperparams['alpha'] - 1.0) < 1e-3 and not self.hyperparams['use_iwae']:
-            log_p_y_xz_mean = torch.mean(log_p_y_xz, dim=0)                       # [nbs]
-            # print('log_p_y_xz_mean', log_p_y_xz_mean)
+            log_p_y_xz_mean = torch.mean(log_p_y_xz, dim=0)  # [nbs]
             log_likelihood = torch.mean(log_p_y_xz_mean)
-            # print('log_likelihood', log_likelihood)
-            ELBO = log_likelihood - self.kl_weight*kl
-            # print('ELBO', ELBO)
+
+            mutual_inf_q = self.mutual_inf_mc(self.latent.q_dist)
+            mutual_inf_p = self.mutual_inf_mc(self.latent.p_dist)
+
+            z_size = self.hyperparams['N'] * self.hyperparams['K']
+            z_dec_w_h = torch.abs(
+                self.node_modules[self.node_type + '/decoder/initial_h'].weight[:, :z_size].data).mean()
+            z_dec_w_c = torch.abs(
+                self.node_modules[self.node_type + '/decoder/initial_c'].weight[:, :z_size].data).mean()
+            z_dec_w = z_dec_w_h + z_dec_w_c
+
+            ELBO = log_likelihood - self.kl_weight * kl + 1. * mutual_inf_p
             loss = -ELBO
-            # print('loss', loss)
 
             if self.log_writer is not None:
-                # self.log_writer.add_scalar('%s/%s' % (str(self.node), 'kl_weight'), self.kl_weight, self.curr_iter)
-                self.log_writer.add_histogram('%s/%s' % (str(self.node), 'log_p_y_xz'), log_p_y_xz_mean, self.curr_iter)
+                self.log_writer.add_histogram('%s/%s' % (str(self.node_type), 'log_p_y_xz'),
+                                              log_p_y_xz_mean,
+                                              self.curr_iter)
 
         else:
-            log_q_z_xy = self.latent.q_log_prob(z)    # [k, nbs]
-            log_p_z_x = self.latent.p_log_prob(z)     # [k, nbs]
+            log_q_z_xy = self.latent.q_log_prob(z)  # [k, nbs]
+            log_p_z_x = self.latent.p_log_prob(z)  # [k, nbs]
             a = self.hyperparams['alpha']
             log_pp_over_q = log_p_y_xz + log_p_z_x - log_q_z_xy
-            log_likelihood = (torch.mean(torch.logsumexp(log_pp_over_q*(1.-a), dim=0)) -\
-                              torch.log(self.hyperparams['k'])) / (1.-a)
+            log_likelihood = (torch.mean(torch.logsumexp(log_pp_over_q * (1. - a), dim=0))
+                              - torch.log(self.hyperparams['k'])) / (1. - a)
             loss = -log_likelihood
 
         if self.log_writer is not None:
-            self.log_writer.add_scalar('%s/%s' % (str(self.node), 'log_likelihood'), log_likelihood, self.curr_iter)
-            self.log_writer.add_scalar('%s/%s' % (str(self.node), 'loss'), loss, self.curr_iter)
-            self.latent.summarize_for_tensorboard(self.log_writer, str(self.node), self.curr_iter)
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'mutual_information_q'),
+                                       mutual_inf_q,
+                                       self.curr_iter)
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'mutual_information_p'),
+                                       mutual_inf_p,
+                                       self.curr_iter)
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'weight_dec_z'),
+                                       z_dec_w,
+                                       self.curr_iter)
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'log_likelihood'),
+                                       log_likelihood,
+                                       self.curr_iter)
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'loss'),
+                                       loss,
+                                       self.curr_iter)
+            self.latent.summarize_for_tensorboard(self.log_writer, str(self.node_type), self.curr_iter)
 
         return loss
 
-
-    def eval_loss(self, inputs, labels, num_predicted_timesteps, 
+    def eval_loss(self,
+                  inputs,
+                  inputs_st,
+                  first_history_indices,
+                  labels,
+                  labels_st,
+                  scene,
+                  node_scene_graph_batched,
+                  timestep,
+                  timesteps_in_scene,
+                  prediction_horizon,
                   compute_naive=True,
-                  compute_exact=True):
+                  compute_exact=True,
+                  compute_sample=True):
         mode = ModeKeys.EVAL
-        our_future = str(self.node) + "_future"
 
-        TD = self.obtain_encoded_tensor_dict(mode, inputs, labels)
+        tensor_dict = self.obtain_encoded_tensor_dict(mode,
+                                                      timestep,
+                                                      timesteps_in_scene,
+                                                      inputs,
+                                                      inputs_st,
+                                                      labels,
+                                                      labels_st,
+                                                      first_history_indices,
+                                                      scene,
+                                                      node_scene_graph_batched)
 
         ### Importance sampled NLL estimate
-        z, _ = self.encoder(TD["x"], TD[self.node.type + "_future_encoder"], mode)      # [k_eval, nbs, N*K]
-        log_p_y_xz = self.decoder(TD["x"], TD[our_future], z, TD, mode, 
-                                  num_predicted_timesteps, 
-                                  self.hyperparams['k_eval'])           # [k_eval, nbs]
-        log_q_z_xy = self.latent.q_log_prob(z)                          # [k_eval, nbs]
-        log_p_z_x = self.latent.p_log_prob(z)                           # [k_eval, nbs]
-        log_likelihood = torch.mean(torch.logsumexp(log_p_y_xz + log_p_z_x - log_q_z_xy, dim=0)) -\
+        z, _ = self.encoder(tensor_dict["x"], tensor_dict[self.node_type + "_future_encoder"],
+                            mode)  # [k_eval, nbs, N*K]
+        log_p_y_xz = self.decoder(tensor_dict["x"], tensor_dict['node_future'], z, tensor_dict, mode,
+                                  prediction_horizon,
+                                  self.hyperparams['k_eval'])  # [k_eval, nbs]
+        log_q_z_xy = self.latent.q_log_prob(z)  # [k_eval, nbs]
+        log_p_z_x = self.latent.p_log_prob(z)  # [k_eval, nbs]
+        log_likelihood = torch.mean(torch.logsumexp(log_p_y_xz + log_p_z_x - log_q_z_xy, dim=0)) - \
                          torch.log(torch.tensor(self.hyperparams['k_eval'], dtype=torch.float, device=self.device))
         nll_q_is = -log_likelihood
 
@@ -964,44 +1000,88 @@ class MultimodalGenerativeCVAE(object):
         nll_p = torch.tensor(np.nan)
         if compute_naive:
             z = self.latent.sample_p(self.hyperparams['k_eval'], mode)
-            log_p_y_xz = self.decoder(TD["x"], TD[our_future], z, TD, mode,
-                                      num_predicted_timesteps,
+            log_p_y_xz = self.decoder(tensor_dict["x"], tensor_dict['node_future'], z, tensor_dict, mode,
+                                      prediction_horizon,
                                       self.hyperparams['k_eval'])
-            log_likelihood_p = torch.mean(torch.logsumexp(log_p_y_xz, dim=0)) -\
-                               torch.log(torch.tensor(self.hyperparams['k_eval'], dtype=torch.float, device=self.device))
+            log_likelihood_p = torch.mean(torch.logsumexp(log_p_y_xz, dim=0)) - \
+                               torch.log(
+                                   torch.tensor(self.hyperparams['k_eval'], dtype=torch.float, device=self.device))
             nll_p = -log_likelihood_p
 
         ### Exact NLL
         nll_exact = torch.tensor(np.nan)
         if compute_exact:
             K, N = self.hyperparams['K'], self.hyperparams['N']
-            if K**N < 50:
-                nbs = TD["x"].size()[0]
-                z_raw = torch.from_numpy(all_one_hot_combinations(N, K).astype(np.float32)).to(self.device).repeat(1, nbs)    # [K**N, nbs*N*K]
-                z = torch.reshape(z_raw, (K**N, -1, N*K))                                                  # [K**N, nbs, N*K]
-                log_p_y_xz = self.decoder(TD["x"], TD[our_future], z, TD, mode,
-                                          num_predicted_timesteps,
-                                          K ** N)                                 # [K**N, nbs]
-                log_p_z_x = self.latent.p_log_prob(z)                                              # [K**N, nbs]
+            if K ** N < 50:
+                nbs = tensor_dict["x"].size()[0]
+                z_raw = torch.from_numpy(
+                    DiscreteLatent.all_one_hot_combinations(N, K).astype(np.float32)
+                ).to(self.device).repeat(1, nbs)  # [K**N, nbs*N*K]
+
+                z = torch.reshape(z_raw, (K ** N, -1, N * K))  # [K**N, nbs, N*K]
+                log_p_y_xz = self.decoder(tensor_dict["x"], tensor_dict['node_future'], z, tensor_dict, mode,
+                                          prediction_horizon,
+                                          K ** N)  # [K**N, nbs]
+                log_p_z_x = self.latent.p_log_prob(z)  # [K**N, nbs]
                 exact_log_likelihood = torch.mean(torch.logsumexp(log_p_y_xz + log_p_z_x, dim=0))
-                
+
                 nll_exact = -exact_log_likelihood
 
-        return nll_q_is, nll_p, nll_exact
+        nll_sampled = torch.tensor(np.nan)
+        if compute_sample:
+            z = self.latent.sample_p(self.hyperparams['k_eval'], mode)
+            y_dist, _ = self.p_y_xz(tensor_dict["x"], z, tensor_dict, ModeKeys.PREDICT, prediction_horizon,
+                                    self.hyperparams['k_eval'])
+            log_p_yt_xz = torch.clamp(y_dist.log_prob(tensor_dict['node_future']),
+                                      max=self.hyperparams['log_p_yt_xz_max'])
+            log_p_y_xz = torch.sum(log_p_yt_xz, dim=2)
+            log_p_y_xz_mean = torch.mean(log_p_y_xz, dim=0)  # [nbs]
+            log_likelihood = torch.mean(log_p_y_xz_mean)
+            nll_sampled = -log_likelihood
 
+        if self.log_writer is not None:
+            self.log_writer.add_scalar('%s/%s' % (str(self.node_type), 'log_likelihood_eval'),
+                                       log_likelihood,
+                                       self.curr_iter)
 
-    def predict(self, inputs, num_predicted_timesteps, num_samples, most_likely=False):
+        return nll_q_is, nll_p, nll_exact, nll_sampled
+
+    def predict(self,
+                inputs,
+                inputs_st,
+                first_history_indices,
+                scene,
+                node_scene_graph_batched,
+                timestep,
+                timesteps_in_scene,
+                prediction_horizon,
+                num_samples_z,
+                num_samples_gmm,
+                most_likely_z=False,
+                all_z=False):
         mode = ModeKeys.PREDICT
 
-        TD = self.obtain_encoded_tensor_dict(mode, inputs)
+        tensor_dict = self.obtain_encoded_tensor_dict(mode,
+                                                      timestep,
+                                                      timesteps_in_scene,
+                                                      inputs,
+                                                      inputs_st,
+                                                      None,
+                                                      None,
+                                                      first_history_indices,
+                                                      scene,
+                                                      node_scene_graph_batched)
 
-        self.latent.p_dist = self.p_z_x(TD["x"], mode)
-        z = self.latent.sample_p(num_samples, mode, most_likely=most_likely)
-        y_dist, our_sampled_future = self.p_y_xz(TD["x"], z, TD, mode,
-                                                 num_predicted_timesteps,
-                                                 num_samples,
-                                                 most_likely=most_likely)      # y_dist.mean is [k, bs, ph*state_dim]
+        self.latent.p_dist = self.p_z_x(tensor_dict["x"], mode)
+        z, num_samples_z = self.latent.sample_p(num_samples_z,
+                                                mode,
+                                                num_samples_gmm=num_samples_gmm,
+                                                most_likely=most_likely_z,
+                                                all_z=all_z)
 
-        predictions_dict = {str(self.node) + "/y": our_sampled_future,
-                            str(self.node) + "/z": z}
-        return predictions_dict
+        y_dist, our_sampled_future = self.p_y_xz(tensor_dict["x"], z, tensor_dict, mode,
+                                                 prediction_horizon,
+                                                 num_samples_z,
+                                                 num_samples_gmm)  # y_dist.mean is [k, bs, ph*state_dim]
+
+        return our_sampled_future

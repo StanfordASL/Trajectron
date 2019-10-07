@@ -1,214 +1,237 @@
 import numpy as np
 import torch
 from model.node_model import MultimodalGenerativeCVAE
-from model.model_utils import ModeKeys, exp_anneal
-from stg_node import STGNode, convert_to_label_node, convert_from_label_node
-from utils import plot_utils
 
-# How to handle removal of edges:
-# Cosine weight the previous output to 0.0 weight over a few timesteps, 
-# then remove that LSTM from computations.
 
-# How to handle addition of edges:
-# Create a new LSTM with zero init hidden state and cosine weight 
-# the added points up to 1.0 weight over a few timesteps.
-# This gating is on the output of the LSTM.
 class SpatioTemporalGraphCVAEModel(object):
     def __init__(self, robot_node, model_registrar,
-                 hyperparams, kwargs_dict, log_writer,
+                 hyperparams, log_writer,
                  device):
         super(SpatioTemporalGraphCVAEModel, self).__init__()
         self.hyperparams = hyperparams
-        self.edge_state_combine_method = kwargs_dict['edge_state_combine_method']
-        self.edge_influence_combine_method = kwargs_dict['edge_influence_combine_method']
-        self.dynamic_edges = kwargs_dict['dynamic_edges']
         self.robot_node = robot_node
         self.log_writer = log_writer
         self.device = device
+        self.curr_iter = 0
 
         self.model_registrar = model_registrar
         self.node_models_dict = dict()
         self.nodes = set()
 
+        self.min_hl = self.hyperparams['minimum_history_length']
+        self.max_hl = self.hyperparams['maximum_history_length']
+        self.ph = self.hyperparams['prediction_horizon']
+        self.state = self.hyperparams['state']
+        self.dims = self.hyperparams['dims']
+        self.pred_state = self.hyperparams['pred_state']
+        self.pred_state_indices = np.arange(self.state.index(self.pred_state) * len(self.dims),
+                                            self.state.index(self.pred_state) * len(self.dims) + len(self.dims))
 
-    def set_scene_graph(self, scene_graph):    
+    def set_scene_graph(self, repr_scene):
         self.node_models_dict.clear()
 
-        for node in scene_graph.nodes:
-            if node != self.robot_node:
-                self.nodes.add(node)
-                kwargs_dict = {'edge_state_combine_method': self.edge_state_combine_method,
-                               'edge_influence_combine_method': self.edge_influence_combine_method,
-                               'dynamic_edges': self.dynamic_edges,
-                               'hyperparams': self.hyperparams}
+        edge_types = repr_scene.get_edge_types()
 
-                self.node_models_dict[str(node)] = MultimodalGenerativeCVAE(node, 
-                                                                            self.model_registrar,
-                                                                            self.robot_node,
-                                                                            kwargs_dict,
-                                                                            self.device,
-                                                                            scene_graph=scene_graph,
-                                                                            log_writer=self.log_writer)
-
+        for node_type in repr_scene.type_enum:
+            self.node_models_dict[node_type] = MultimodalGenerativeCVAE(node_type,
+                                                                        self.model_registrar,
+                                                                        self.robot_node,
+                                                                        self.hyperparams,
+                                                                        self.device,
+                                                                        edge_types,
+                                                                        log_writer=self.log_writer)
 
     def set_curr_iter(self, curr_iter):
         self.curr_iter = curr_iter
         for node_str, model in self.node_models_dict.items():
             model.set_curr_iter(curr_iter)
 
-
     def set_annealing_params(self):
         for node_str, model in self.node_models_dict.items():
             model.set_annealing_params()
-
 
     def step_annealers(self):
         for node in self.node_models_dict:
             self.node_models_dict[node].step_annealers()
 
+    def get_input(self, scene, timesteps, node_type, min_future_timesteps):
+        inputs = list()
+        first_history_indices = list()
+        nodes = list()
+        node_scene_graph_batched = list()
+        timesteps_in_scene = list()
+        nodes_per_ts = scene.present_nodes(timesteps,
+                                           type=node_type,
+                                           min_history_timesteps=self.min_hl,
+                                           min_future_timesteps=min_future_timesteps)
 
-    def train_loss(self, inputs, labels, num_predicted_timesteps):
-        mode = ModeKeys.TRAIN
-        inputs, labels = self.standardize(mode, inputs, labels)
+        # Get Inputs for each node present in Scene
+        for timestep in timesteps:
+            if timestep in nodes_per_ts.keys():
+                present_nodes = nodes_per_ts[timestep]
+                timestep_range = np.array([timestep - self.max_hl, timestep + min_future_timesteps])
+                scene_graph_t = scene.get_scene_graph(timestep,
+                                                      edge_radius=self.hyperparams['edge_radius'],
+                                                      dims=self.dims,
+                                                      edge_addition_filter_l=len(self.hyperparams['edge_addition_filter']),
+                                                      edge_removal_filter_l=len(self.hyperparams['edge_removal_filter']))
 
-        # This is important to ensure that each node model is using the same training data points.
-        mhl, ph = self.hyperparams['minimum_history_length'], self.hyperparams['prediction_horizon']
-        if np.any(inputs['traj_lengths'] < mhl + ph):
-            batch_size = inputs['traj_lengths'].shape[0]
-            idxs_to_keep = [batch_idx for batch_idx, traj_len in enumerate(inputs['traj_lengths']) if traj_len >= mhl + ph]
+                for node in present_nodes:
+                    timesteps_in_scene.append(timestep)
+                    input = node.get(timestep_range, self.state, self.dims)
+                    first_history_index = (self.max_hl - node.history_points_at(timestep)).clip(0)
+                    inputs.append(input)
+                    first_history_indices.append(first_history_index)
+                    nodes.append(node)
 
-            for key, value in inputs.items():
-                inputs[key] = value[idxs_to_keep]
+                    node_scene_graph_batched.append((node, scene_graph_t))
 
-            for key, value in labels.items():
-                labels[key] = value[idxs_to_keep]
+        return inputs, first_history_indices, timesteps_in_scene, node_scene_graph_batched, nodes
 
-            print("""WARNING: There are trajectory lengths less than %d (= minimum_history_length + prediction_horizon) in the training input!
-Ignoring those indices, the batch size will be reduced from %d to %d.""" % (mhl + ph, batch_size, inputs['traj_lengths'].shape[0]))
-
-        traj_lengths = inputs['traj_lengths']
-        prediction_timesteps = mhl - 1 + torch.fmod(torch.randint(low=0, 
-                                                                  high=2**31-1, 
-                                                                  size=traj_lengths.shape).to(self.device),
-                                                    traj_lengths-mhl-ph+1).long()
-
+    def train_loss(self, scene, timesteps):
         losses = list()
-        for node in self.nodes:
-            model = self.node_models_dict[str(node)]
-            losses.append(model.train_loss(inputs, 
-                                           labels[convert_to_label_node(node)],
-                                           num_predicted_timesteps,
-                                           prediction_timesteps))
+        for node_type in scene.type_enum:
+            # Get Input data for node type and given timesteps
+            (inputs,
+             first_history_indices,
+             timesteps_in_scene,
+             node_scene_graph_batched, _) = self.get_input(scene, timesteps, node_type, self.ph)
 
-        mean_loss = torch.mean(torch.stack(losses))
+            # There are no nodes of type present for timestep
+            if len(inputs) == 0:
+                continue
+
+            # Standardize
+            inputs_st = scene.standardize(inputs, self.state, self.dims)
+
+            # Convert to torch tensors
+            inputs = torch.tensor(inputs).float().to(self.device)
+            inputs_st = torch.tensor(inputs_st).float().to(self.device)
+            first_history_indices = torch.tensor(first_history_indices).float().to(self.device).long()
+            labels = inputs[:, :, self.pred_state_indices]
+            labels_st = inputs_st[:, :, self.pred_state_indices]
+
+            # Run forward pass
+            model = self.node_models_dict[node_type]
+            loss = model.train_loss(inputs,
+                                    inputs_st,
+                                    first_history_indices,
+                                    labels,
+                                    labels_st,
+                                    scene,
+                                    node_scene_graph_batched,
+                                    timestep=self.max_hl,
+                                    timesteps_in_scene=timesteps_in_scene,
+                                    prediction_horizon=self.ph)
+
+            losses.append(loss)
+
+        mean_loss = torch.mean(torch.stack(losses)) if len(losses) > 0 else None
         return mean_loss
 
-
-    def eval_loss(self, orig_inputs, orig_labels, num_predicted_timesteps):
-        mode = ModeKeys.EVAL
-        inputs, labels = self.standardize(mode, orig_inputs, orig_labels)
-
-        # This is important to ensure that each node model is using the same eval data points.
-        mhl, ph = self.hyperparams['minimum_history_length'], self.hyperparams['prediction_horizon']
-        if np.any(inputs['traj_lengths'] < mhl + ph):
-            batch_size = inputs['traj_lengths'].shape[0]
-            idxs_to_keep = [batch_idx for batch_idx, traj_len in enumerate(inputs['traj_lengths']) if traj_len >= mhl + ph]
-
-            for key, value in inputs.items():
-                inputs[key] = value[idxs_to_keep]
-
-            for key, value in labels.items():
-                labels[key] = value[idxs_to_keep]
-
-            print("""WARNING: There are trajectory lengths less than %d (= minimum_history_length + prediction_horizon) in the evaluation input!
-Ignoring those indices, the batch size will be reduced from %d to %d.""" % (mhl + ph, batch_size, inputs['traj_lengths'].shape[0]))
-
+    def eval_loss(self, scene, timesteps):
         nll_q_is_values = list()
         nll_p_values = list()
         nll_exact_values = list()
-        for node in self.nodes:
-            model = self.node_models_dict[str(node)]
-            (nll_q_is, nll_p, nll_exact) = model.eval_loss(inputs,
-                                                           labels[convert_to_label_node(node)],
-                                                           num_predicted_timesteps)
-            nll_q_is_values.append(nll_q_is)
-            nll_p_values.append(nll_p)
-            nll_exact_values.append(nll_exact)
+        nll_sampled_values = list()
+        for node_type in scene.type_enum:
+            # Get Input data for node type and given timesteps
+            (inputs,
+             first_history_indices,
+             timesteps_in_scene,
+             node_scene_graph_batched, _) = self.get_input(scene, timesteps, node_type, self.ph)
 
-        nll_q_is, nll_p, nll_exact = torch.mean(torch.stack(nll_q_is_values)), torch.mean(torch.stack(nll_p_values)), torch.mean(torch.stack(nll_exact_values))
-        return nll_q_is, nll_p, nll_exact
+            # There are no nodes of type present for timestep
+            if len(inputs) == 0:
+                continue
 
+            # Standardize
+            inputs_st = scene.standardize(inputs, self.state, self.dims)
 
-    def predict(self, inputs, num_predicted_timesteps, num_samples, most_likely=False):
-        mode = ModeKeys.PREDICT
-        inputs = self.standardize(mode, inputs)
+            # Convert to torch tensors
+            inputs = torch.tensor(inputs).float().to(self.device)
+            inputs_st = torch.tensor(inputs_st).float().to(self.device)
+            first_history_indices = torch.tensor(first_history_indices).float().to(self.device).long()
+            labels = inputs[:, :, self.pred_state_indices]
+            labels_st = inputs_st[:, :, self.pred_state_indices]
 
-        predictions_dict = dict()
-        for node in self.nodes:
-            model = self.node_models_dict[str(node)]
-            output_dict = model.predict(inputs, num_predicted_timesteps, num_samples, most_likely=most_likely)
+            # Run forward pass
+            model = self.node_models_dict[node_type]
+            (nll_q_is, nll_p, nll_exact, nll_sampled) = model.eval_loss(inputs,
+                                                                        inputs_st,
+                                                                        first_history_indices,
+                                                                        labels,
+                                                                        labels_st,
+                                                                        scene,
+                                                                        node_scene_graph_batched,
+                                                                        timestep=self.max_hl,
+                                                                        timesteps_in_scene=timesteps_in_scene,
+                                                                        prediction_horizon=self.ph)
 
-            node_mean = self.hyperparams['nodes_standardization'][node]['mean'][self.hyperparams['pred_indices']]
-            node_std = self.hyperparams['nodes_standardization'][node]['std'][self.hyperparams['pred_indices']]
-            output_dict[str(node) + "/y"] = self.unstandardize(output_dict[str(node) + "/y"], node_mean, node_std)
-            predictions_dict.update(output_dict)
+            if nll_q_is is not None:
+                nll_q_is_values.append(nll_q_is)
+                nll_p_values.append(nll_p)
+                nll_exact_values.append(nll_exact)
+                nll_sampled_values.append(nll_sampled)
+
+        (nll_q_is, nll_p, nll_exact, nll_sampled) = (torch.mean(torch.stack(nll_q_is_values)),
+                                                     torch.mean(torch.stack(nll_p_values)),
+                                                     torch.mean(torch.stack(nll_exact_values)),
+                                                     torch.mean(torch.stack(nll_sampled_values)))
+        return nll_q_is.cpu().numpy(), nll_p.cpu().numpy(), nll_exact.cpu().numpy(), nll_sampled.cpu().numpy()
+
+    def predict(self,
+                scene,
+                timesteps,
+                ph,
+                num_samples_z=1,
+                num_samples_gmm=1,
+                min_future_timesteps=0,
+                most_likely_z=False,
+                all_z=False):
+
+        predictions_dict = {}
+        for node_type in scene.type_enum:
+            # Get Input data for node type and given timesteps
+            (inputs,
+             first_history_indices,
+             timesteps_in_scene,
+             node_scene_graph_batched,
+             nodes) = self.get_input(scene, timesteps, node_type, min_future_timesteps)
+
+            # There are no nodes of type present for timestep
+            if len(inputs) == 0:
+                continue
+
+            # Standardize
+            inputs_st = scene.standardize(inputs, self.state, self.dims)
+
+            # Convert to torch tensors
+            inputs = torch.tensor(inputs).float().to(self.device)
+            inputs_st = torch.tensor(inputs_st).float().to(self.device)
+            first_history_indices = torch.tensor(first_history_indices).float().to(self.device).long()
+
+            # Run forward pass
+            model = self.node_models_dict[node_type]
+            predictions = model.predict(inputs,
+                                        inputs_st,
+                                        first_history_indices,
+                                        scene,
+                                        node_scene_graph_batched,
+                                        timestep=self.max_hl,
+                                        timesteps_in_scene=timesteps_in_scene,
+                                        prediction_horizon=ph,
+                                        num_samples_z=num_samples_z,
+                                        num_samples_gmm=num_samples_gmm,
+                                        most_likely_z=most_likely_z,
+                                        all_z=all_z)
+            predictions_uns = scene.unstandardize(predictions.cpu().detach().numpy(), [self.pred_state], self.dims)
+
+            # Assign predictions to node
+            for i, ts in enumerate(timesteps_in_scene):
+                if not  ts in predictions_dict.keys():
+                    predictions_dict[ts] = dict()
+                predictions_dict[ts][nodes[i]] = predictions_uns[:, :, i]
 
         return predictions_dict
 
-
-    def standardize_fn(self, tensor, mean, std):
-        return (tensor - mean) / std
-
-
-    def standardize(self, mode, inputs, labels=None):
-        features_standardized = dict()
-
-        if 'traj_lengths' in inputs:
-            features_standardized['traj_lengths'] = inputs['traj_lengths']
-
-        if 'edge_scaling_mask' in inputs:
-            features_standardized['edge_scaling_mask'] = inputs['edge_scaling_mask']
-
-        for node in inputs:
-            if isinstance(node, STGNode) or (mode == ModeKeys.PREDICT and node == str(self.robot_node) + '_future'):
-                if mode == ModeKeys.PREDICT and node == str(self.robot_node) + '_future':
-                    # This is handling the case of normalizing the future robot actions, 
-                    # which really should just take the same normalization as the robot
-                    # from training.
-                    node_mean = self.hyperparams['nodes_standardization'][self.robot_node]['mean']
-                    node_std = self.hyperparams['nodes_standardization'][self.robot_node]['std']
-                else:
-                    node_mean = self.hyperparams['nodes_standardization'][node]['mean']
-                    node_std = self.hyperparams['nodes_standardization'][node]['std']
-
-                node_mean = torch.from_numpy(node_mean).float().to(self.device)
-                node_std = torch.from_numpy(node_std).float().to(self.device)
-
-                features_standardized[node] = self.standardize_fn(inputs[node], node_mean, node_std)
-                if mode == ModeKeys.TRAIN and self.hyperparams['fuzz_factor'] > 0:
-                    features_standardized[node] += self.hyperparams['fuzz_factor']*torch.randn_like(features_standardized[node])
-
-        if labels is None:
-            return features_standardized
-
-        labels_standardized = dict()
-        for label in labels:
-            if isinstance(label, STGNode):
-                label_node = convert_from_label_node(label)
-                node_mean = self.hyperparams['nodes_standardization'][label_node]['mean'][self.hyperparams['pred_indices']]
-                node_std = self.hyperparams['nodes_standardization'][label_node]['std'][self.hyperparams['pred_indices']]
-
-                node_mean = torch.from_numpy(node_mean).float().to(self.device)
-                node_std = torch.from_numpy(node_std).float().to(self.device)
-
-                labels_standardized[label] = self.standardize_fn(labels[label], node_mean, node_std)
-                if mode == ModeKeys.TRAIN and self.hyperparams['fuzz_factor'] > 0:
-                    labels_standardized[label] += self.hyperparams['fuzz_factor']*torch.randn_like(labels_standardized[label])
-
-        return features_standardized, labels_standardized
-
-
-    def unstandardize(self, output, labels_mean, labels_std):
-        torch_std = torch.from_numpy(labels_std).float().to(self.device)
-        torch_mean = torch.from_numpy(labels_mean).float().to(self.device)
-        return output * torch_std + torch_mean

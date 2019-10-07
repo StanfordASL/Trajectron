@@ -2,12 +2,22 @@ import torch
 import torch.nn.utils.rnn as rnn
 from enum import Enum
 import functools
+import numpy as np
 
 
 class ModeKeys(Enum):
     TRAIN = 1
     EVAL = 2
     PREDICT = 3
+
+
+def tile(a, dim, n_tile, device='cpu'):
+    init_dim = a.size(dim)
+    repeat_idx = [1] * a.dim()
+    repeat_idx[dim] = n_tile
+    a = a.repeat(*(repeat_idx))
+    order_index = torch.LongTensor(np.concatenate([init_dim * np.arange(n_tile) + i for i in range(init_dim)])).to(device)
+    return torch.index_select(a, dim, order_index)
 
 
 def to_one_hot(labels, n_labels, device):
@@ -40,30 +50,36 @@ class CustomLR(torch.optim.lr_scheduler.LambdaLR):
                 for lmbda, base_lr in zip(self.lr_lambdas, self.base_lrs)]
 
 
-def run_lstm_on_variable_length_seqs(lstm_module, original_seqs, break_indices):
+def run_lstm_on_variable_length_seqs(lstm_module, original_seqs, break_indices, lower_indices, total_length):
     # This is done so that we can just pass in self.prediction_timesteps
     # (which we want to INCLUDE, so this will exclude the next timestep).
     inclusive_break_indices = break_indices + 1
 
     pad_list = list()
-    sorted_break_idxs, unsort_idxs = torch.sort(inclusive_break_indices, descending=True)
-    for i, seq_len in enumerate(sorted_break_idxs):
-        pad_list.append(original_seqs[i, :seq_len])
+    for i, seq_len in enumerate(inclusive_break_indices):
+        pad_list.append(original_seqs[i, lower_indices[i]:seq_len])
 
-    packed_seqs = rnn.pack_sequence(pad_list)
+    packed_seqs = rnn.pack_sequence(pad_list, enforce_sorted=False)
     packed_output, (h_n, c_n) = lstm_module(packed_seqs)
-    output, _ = rnn.pad_packed_sequence(packed_output, 
+    output, _ = rnn.pad_packed_sequence(packed_output,
                                         batch_first=True,
-                                        total_length=torch.max(inclusive_break_indices))
-    
-    # Returning it in its original order.
-    return output[unsort_idxs], (h_n[:, unsort_idxs], c_n[:, unsort_idxs])
+                                        total_length=total_length)
+
+    return output, (h_n, c_n)
 
 
 def extract_subtensor_per_batch_element(tensor, indices):
     batch_idxs = torch.arange(start=0, end=len(indices))
+
+    batch_idxs = batch_idxs[~torch.isnan(indices)]
+    indices = indices[~torch.isnan(indices)]
+    if indices.size == 0:
+        return None
+    else:
+        indices = indices.long()
     if tensor.is_cuda:
         batch_idxs = batch_idxs.to(tensor.get_device())
+        indices = indices.to(tensor.get_device())
     return tensor[batch_idxs, indices]
 
 
@@ -73,7 +89,7 @@ def unpack_RNN_state(state_tuple):
 
     state = torch.cat(state_tuple, dim=0).permute(1, 0, 2)
     # Now state is (batch, 2 * num_layers * num_directions, hidden_size)
-    
+
     state_size = state.size()
     return torch.reshape(state, (-1, state_size[1] * state_size[2]))
 
@@ -83,7 +99,7 @@ def rsetattr(obj, attr, val):
     return setattr(rgetattr(obj, pre) if pre else obj, post, val)
 
 
-# using wonder's beautiful simplification: 
+# using wonder's beautiful simplification:
 # https://stackoverflow.com/questions/31174295/getattr-and-setattr-on-nested-objects/31174427?noredirect=1#comment86638618_31174427
 def rgetattr(obj, attr, *args):
     def _getattr(obj, attr):
