@@ -1,3 +1,5 @@
+**NOTE:** A new version of the Trajectron has been released! Check out [Trajectron++](https://github.com/StanfordASL/Trajectron-plus-plus)!
+
 # The Trajectron: Probabilistic Multi-Agent Trajectory Modeling with Dynamic Spatiotemporal Graphs
 
 This repository contains the code for [The Trajectron: Probabilistic Multi-Agent Trajectory Modeling with Dynamic Spatiotemporal Graphs](https://arxiv.org/abs/1810.05993) by Boris Ivanovic and Marco Pavone.
